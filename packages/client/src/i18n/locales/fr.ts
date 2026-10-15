@@ -1,3 +1,5 @@
+import { themePresetMessages } from '../theme-preset-locales'
+import { themeAppearanceMessages } from '../theme-appearance-locales'
 import { socialMessagesFr } from '../social-messages-locales'
 
 export default {
@@ -2043,6 +2045,8 @@ jobTriggered: 'Job declenche',
 
   // Settings
   theme: {
+    presets: themePresetMessages['fr'],
+    customization: themeAppearanceMessages['fr'],
     title: 'Thème',
     saved: 'Thème enregistré',
     saveFailed: 'Échec de l’enregistrement du thème',

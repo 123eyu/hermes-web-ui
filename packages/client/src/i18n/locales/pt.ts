@@ -1,3 +1,5 @@
+import { themePresetMessages } from '../theme-preset-locales'
+import { themeAppearanceMessages } from '../theme-appearance-locales'
 import { socialMessagesPt } from '../social-messages-locales'
 
 export default {
@@ -2043,6 +2045,8 @@ jobTriggered: 'Job acionado',
 
   // Settings
   theme: {
+    presets: themePresetMessages['pt'],
+    customization: themeAppearanceMessages['pt'],
     title: 'Tema',
     saved: 'Tema salvo',
     saveFailed: 'Falha ao salvar o tema',

@@ -1,5 +1,7 @@
 <script setup lang="ts">
+import ThemePresetManager from '@/components/layout/ThemePresetManager.vue'
 import PageHeader from '@/components/layout/PageHeader.vue'
+import ThemeAppearanceEditor from '@/components/layout/ThemeAppearanceEditor.vue'
 import { computed, ref } from 'vue'
 import { NButton, NInputNumber, NSelect, useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
@@ -27,6 +29,7 @@ const fileInput = ref<HTMLInputElement | null>(null)
 const backgroundBusy = ref(false)
 const {
   brightness,
+  appearance,
   style,
   isDark,
   fontSize,
@@ -34,8 +37,7 @@ const {
   accentColor,
   backgroundImageUrl,
   backgroundImageName,
-  setBrightness,
-  setStyle,
+  presetBusy,
   previewThemeSettings,
   saveThemeCustomization,
   resetCustomization,
@@ -152,7 +154,7 @@ async function handleReset() {
     <header class="page-header">
       <h2 class="header-title">{{ t('theme.title') }}</h2>
       <div class="header-actions">
-        <NButton size="small" secondary @click="handleReset">
+        <NButton size="small" secondary :disabled="presetBusy" @click="handleReset">
           {{ t('theme.reset') }}
         </NButton>
       </div>
@@ -160,111 +162,8 @@ async function handleReset() {
     </PageHeader>
 
     <div class="theme-content">
-      <section class="theme-card">
-        <div class="section-heading">
-          <div>
-            <h3>{{ t('theme.appearance') }}</h3>
-            <p>{{ t('theme.appearanceHint') }}</p>
-          </div>
-        </div>
-
-        <div class="theme-setting">
-          <div>
-            <label>{{ t('theme.mode') }}</label>
-            <p>{{ t('theme.modeHint') }}</p>
-          </div>
-          <NSelect
-            :value="brightness"
-            :options="brightnessOptions"
-            size="small"
-            class="theme-select"
-            @update:value="value => setBrightness(value as BrightnessMode)"
-          />
-        </div>
-
-        <div class="theme-setting">
-          <div>
-            <label>{{ t('theme.style') }}</label>
-            <p>{{ t('theme.styleHint') }}</p>
-          </div>
-          <NSelect
-            :value="style"
-            :options="styleOptions"
-            size="small"
-            class="theme-select"
-            @update:value="value => setStyle(value as ThemeStyle)"
-          />
-        </div>
-
-        <div class="theme-setting">
-          <div>
-            <label>{{ t('theme.fontSize') }}</label>
-            <p>{{ t('theme.fontSizeHint') }}</p>
-          </div>
-          <NInputNumber
-            :value="fontSize"
-            :min="MIN_THEME_FONT_SIZE"
-            :max="MAX_THEME_FONT_SIZE"
-            :step="1"
-            size="small"
-            class="font-size-input"
-            @update:value="handleFontSizeChange"
-          >
-            <template #suffix>px</template>
-          </NInputNumber>
-        </div>
-
-        <div class="theme-setting">
-          <div>
-            <label>{{ t('theme.textColor') }}</label>
-            <p>{{ t('theme.textColorHint') }}</p>
-          </div>
-          <div class="color-control">
-            <input
-              type="color"
-              :value="resolvedTextColor"
-              :aria-label="t('theme.textColor')"
-              @input="previewTextColor"
-              @change="saveTextColor"
-            />
-            <code>{{ resolvedTextColor }}</code>
-            <NButton
-              v-if="textColor"
-              size="tiny"
-              text
-              @click="savePatch({ textColor: null })"
-            >
-              {{ t('common.reset') }}
-            </NButton>
-          </div>
-        </div>
-
-        <div class="theme-setting">
-          <div>
-            <label>{{ t('theme.accentColor') }}</label>
-            <p>{{ t('theme.accentColorHint') }}</p>
-          </div>
-          <div class="color-control">
-            <input
-              type="color"
-              :value="resolvedAccentColor"
-              :aria-label="t('theme.accentColor')"
-              @input="previewAccentColor"
-              @change="saveAccentColor"
-            />
-            <code>{{ resolvedAccentColor }}</code>
-            <NButton
-              v-if="accentColor"
-              size="tiny"
-              text
-              @click="savePatch({ accentColor: null })"
-            >
-              {{ t('common.reset') }}
-            </NButton>
-          </div>
-        </div>
-      </section>
-
+      <ThemePresetManager />
+      <div class="theme-editors" :inert="presetBusy">
       <section class="theme-card">
         <div class="section-heading">
           <div>
@@ -300,6 +199,112 @@ async function handleReset() {
         <p class="background-note">{{ t('theme.backgroundNote') }}</p>
       </section>
 
+      <ThemeAppearanceEditor
+        :model-value="appearance"
+        @preview="value => previewThemeSettings({ appearance: value })"
+        @save="value => savePatch({ appearance: value })"
+      >
+        <template #global>
+          <div class="theme-global-settings">
+            <div class="theme-setting">
+              <div>
+                <label>{{ t('theme.mode') }}</label>
+                <p>{{ t('theme.modeHint') }}</p>
+              </div>
+              <NSelect
+                :value="brightness"
+                :options="brightnessOptions"
+                size="small"
+                class="theme-select"
+                @update:value="value => savePatch({ brightness: value as BrightnessMode })"
+              />
+            </div>
+
+            <div class="theme-setting">
+              <div>
+                <label>{{ t('theme.style') }}</label>
+                <p>{{ t('theme.styleHint') }}</p>
+              </div>
+              <NSelect
+                :value="style"
+                :options="styleOptions"
+                size="small"
+                class="theme-select"
+                @update:value="value => savePatch({ style: value as ThemeStyle })"
+              />
+            </div>
+
+            <div class="theme-setting">
+              <div>
+                <label>{{ t('theme.fontSize') }}</label>
+                <p>{{ t('theme.fontSizeHint') }}</p>
+              </div>
+              <NInputNumber
+                :value="fontSize"
+                :min="MIN_THEME_FONT_SIZE"
+                :max="MAX_THEME_FONT_SIZE"
+                :step="1"
+                size="small"
+                class="font-size-input"
+                @update:value="handleFontSizeChange"
+              >
+                <template #suffix>px</template>
+              </NInputNumber>
+            </div>
+
+            <div class="theme-setting">
+              <div>
+                <label>{{ t('theme.textColor') }}</label>
+                <p>{{ t('theme.textColorHint') }}</p>
+              </div>
+              <div class="color-control">
+                <input
+                  type="color"
+                  :value="resolvedTextColor"
+                  :aria-label="t('theme.textColor')"
+                  @input="previewTextColor"
+                  @change="saveTextColor"
+                />
+                <code>{{ resolvedTextColor }}</code>
+                <NButton
+                  v-if="textColor"
+                  size="tiny"
+                  text
+                  @click="savePatch({ textColor: null })"
+                >
+                  {{ t('common.reset') }}
+                </NButton>
+              </div>
+            </div>
+
+            <div class="theme-setting">
+              <div>
+                <label>{{ t('theme.accentColor') }}</label>
+                <p>{{ t('theme.accentColorHint') }}</p>
+              </div>
+              <div class="color-control">
+                <input
+                  type="color"
+                  :value="resolvedAccentColor"
+                  :aria-label="t('theme.accentColor')"
+                  @input="previewAccentColor"
+                  @change="saveAccentColor"
+                />
+                <code>{{ resolvedAccentColor }}</code>
+                <NButton
+                  v-if="accentColor"
+                  size="tiny"
+                  text
+                  @click="savePatch({ accentColor: null })"
+                >
+                  {{ t('common.reset') }}
+                </NButton>
+              </div>
+            </div>
+          </div>
+        </template>
+      </ThemeAppearanceEditor>
+
       <section class="theme-preview">
         <div class="preview-copy">
           <span class="preview-kicker">{{ t('theme.preview') }}</span>
@@ -308,6 +313,7 @@ async function handleReset() {
           <button type="button">{{ t('theme.previewAction') }}</button>
         </div>
       </section>
+      </div>
     </div>
   </div>
 </template>
@@ -326,42 +332,53 @@ async function handleReset() {
 .theme-content {
   width: 100%;
   box-sizing: border-box;
-  padding: 20px;
+  padding: calc(20px * var(--spacing-scale, 1));
   overflow-y: auto;
   display: grid;
-  gap: 16px;
+  gap: calc(16px * var(--spacing-scale, 1));
+}
+
+.theme-editors {
+  display: grid;
+  gap: calc(16px * var(--spacing-scale, 1));
+  min-width: 0;
 }
 
 .theme-card,
 .theme-preview {
-  border: 1px solid $border-color;
+  border: var(--border-width, 1px) solid $border-color;
   border-radius: $radius-lg;
-  background: rgba(var(--bg-card-rgb), 0.94);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.06);
+  background: var(--theme-card-bg, rgba(var(--bg-card-rgb), 0.94));
+  box-shadow: var(--theme-card-shadow, 0 8px 24px rgba(0, 0, 0, 0.06));
+  backdrop-filter: var(--theme-card-filter, none);
 }
 
 .theme-card {
-  padding: 18px;
+  padding: calc(18px * var(--spacing-scale, 1));
 }
 
 .section-heading {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 16px;
-  padding-bottom: 14px;
+  gap: calc(16px * var(--spacing-scale, 1));
+  padding-bottom: calc(14px * var(--spacing-scale, 1));
 
   h3 {
     margin: 0;
-    font-size: 15px;
+    font-size: calc(var(--font-size-base, 14px) * 15 / 14);
     font-weight: 600;
   }
 
   p {
     margin-top: 3px;
     color: $text-muted;
-    font-size: 12px;
+    font-size: calc(var(--font-size-base, 14px) * 12 / 14);
   }
+}
+
+.theme-global-settings {
+  margin-bottom: calc(20px * var(--spacing-scale, 1));
 }
 
 .theme-setting {
@@ -369,18 +386,18 @@ async function handleReset() {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 20px;
-  border-top: 1px solid $border-light;
+  gap: calc(20px * var(--spacing-scale, 1));
+  border-top: var(--border-width, 1px) solid $border-light;
 
   label {
-    font-size: 13px;
+    font-size: calc(var(--font-size-base, 14px) * 13 / 14);
     font-weight: 500;
   }
 
   p {
     margin-top: 2px;
     color: $text-muted;
-    font-size: 12px;
+    font-size: calc(var(--font-size-base, 14px) * 12 / 14);
   }
 }
 
@@ -393,24 +410,24 @@ async function handleReset() {
 .background-actions {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: calc(10px * var(--spacing-scale, 1));
 }
 
 .color-control {
   input {
     width: 34px;
     height: 34px;
-    padding: 2px;
-    border: 1px solid $border-color;
+    padding: calc(2px * var(--spacing-scale, 1));
+    border: var(--border-width, 1px) solid $border-color;
     border-radius: $radius-sm;
-    background: $bg-card;
+    background: var(--theme-card-bg, $bg-card);
     cursor: pointer;
   }
 
   code {
     width: 70px;
     color: $text-secondary;
-    font-size: 12px;
+    font-size: calc(var(--font-size-base, 14px) * 12 / 14);
   }
 }
 
@@ -424,7 +441,7 @@ async function handleReset() {
   display: grid;
   place-items: center;
   overflow: hidden;
-  border: 1px solid $border-color;
+  border: var(--border-width, 1px) solid $border-color;
   border-radius: $radius-md;
   background-color: $bg-secondary;
   background-position: center;
@@ -448,12 +465,12 @@ async function handleReset() {
   right: 10px;
   bottom: 10px;
   max-width: calc(100% - 20px);
-  padding: 4px 8px;
+  padding: calc(4px * var(--spacing-scale, 1)) calc(8px * var(--spacing-scale, 1));
   overflow: hidden;
-  border-radius: 5px;
+  border-radius: var(--radius-component, 5px);
   background: rgba(0, 0, 0, 0.62);
   color: var(--text-on-overlay);
-  font-size: 11px;
+  font-size: calc(var(--font-size-base, 14px) * 11 / 14);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -461,17 +478,17 @@ async function handleReset() {
 .background-note {
   margin-top: 10px;
   color: $text-muted;
-  font-size: 11px;
+  font-size: calc(var(--font-size-base, 14px) * 11 / 14);
 }
 
 .theme-preview {
   min-height: 210px;
-  padding: 32px;
+  padding: calc(32px * var(--spacing-scale, 1));
   display: flex;
   align-items: flex-end;
   background:
     linear-gradient(135deg, rgba(var(--accent-primary-rgb), 0.14), transparent 58%),
-    rgba(var(--bg-card-rgb), 0.94);
+    var(--theme-card-bg, rgba(var(--bg-card-rgb), 0.94));
 }
 
 .preview-copy {
@@ -479,7 +496,7 @@ async function handleReset() {
 
   .preview-kicker {
     color: $accent-primary;
-    font-size: 11px;
+    font-size: calc(var(--font-size-base, 14px) * 11 / 14);
     font-weight: 600;
     letter-spacing: 0.08em;
     text-transform: uppercase;
@@ -497,7 +514,7 @@ async function handleReset() {
 
   button {
     margin-top: 16px;
-    padding: 8px 14px;
+    padding: calc(8px * var(--spacing-scale, 1)) calc(14px * var(--spacing-scale, 1));
     border: none;
     border-radius: $radius-sm;
     background: $accent-primary;
@@ -508,7 +525,7 @@ async function handleReset() {
 
 @media (max-width: $breakpoint-mobile) {
   .theme-content {
-    padding: 12px;
+    padding: calc(12px * var(--spacing-scale, 1));
   }
 
   .section-heading,
@@ -518,8 +535,8 @@ async function handleReset() {
   }
 
   .theme-setting {
-    padding: 12px 0;
-    gap: 8px;
+    padding: calc(12px * var(--spacing-scale, 1)) 0;
+    gap: calc(8px * var(--spacing-scale, 1));
   }
 
   .theme-select,
