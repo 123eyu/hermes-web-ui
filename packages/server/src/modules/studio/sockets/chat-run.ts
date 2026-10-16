@@ -508,7 +508,9 @@ export class ChatRunSocket {
     if (!['run.completed', 'run.failed', 'abort.completed'].includes(event)) return
     runMcpCredentials.revoke(sessionId, contextId)
     this.clarificationRuns.finishSession(sessionId, contextId)
-    const interrupted = event === 'abort.completed' || payload?.interrupted === true || payload?.result?.interrupted === true || this.sessionMap.get(sessionId)?.isAborting
+    // A queue boundary can finish after its queued input was removed. Runtime
+    // interrupt flags alone do not mean the user pressed Stop.
+    const interrupted = event === 'abort.completed' || this.sessionMap.get(sessionId)?.isAborting
     const executionState = interrupted ? 'interrupted' : event === 'run.failed' ? 'failed' : 'ended'
     try {
       if (contextId) this.taskPlanRuns.finish(contextId, executionState)
@@ -1621,6 +1623,7 @@ export class ChatRunSocket {
     }
     if (data.session_id) {
       const state = getOrCreateSession(this.sessionMap, data.session_id)
+      if (!data.autonomous && !data.background_delegation_id) state.backgroundWakeStopped = false
       state.webhookAgent = webhookAgentForRun(data)
       state.webhookRoomId = data.group_room_id
       state.webhookWorkflowId = data.workflow_id
@@ -1950,6 +1953,10 @@ export class ChatRunSocket {
     const state = await this.sessionStateForBackground(sessionId)
     if (!state) {
       await releaseClaim()
+      return
+    }
+    if (state.backgroundWakeStopped) {
+      await this.backgroundBridge.completeBackgroundNotification(sessionId, notification.profile, delegationId, claimId)
       return
     }
     if (this.closing) {
@@ -2307,6 +2314,10 @@ export class ChatRunSocket {
     const control = state.queueInsertion
     if (!control) return
     state.queueInsertion = undefined
+    if (reason === 'queued_message_removed' && control.runtime === 'hermes' && control.runId) {
+      void this.bridge.cancelBoundaryInterrupt(sessionId, control.runId, state.profile)
+        .catch((err: unknown) => logger.warn(err, '[chat-run-socket] failed to recall queue boundary for %s', sessionId))
+    }
     this.emitQueueInsertionUpdate(sessionId, control, 'cancelled', reason)
   }
 
@@ -2384,7 +2395,14 @@ export class ChatRunSocket {
         : await this.bridge.requestBoundaryInterrupt(sessionId, control.runId, state.profile)
 
       const current = this.sessionMap.get(sessionId)?.queueInsertion
-      if (!current || current.generation !== generation) return
+      if (!current || current.generation !== generation) {
+        // Cancellation may race the asynchronous request acknowledgement.
+        if (!current && control.runtime === 'hermes' && control.runId
+          && (result.status === 'accepted' || result.status === 'already_pending')) {
+          await this.bridge.cancelBoundaryInterrupt(sessionId, control.runId, state.profile)
+        }
+        return
+      }
       if (result.status !== 'accepted' && result.status !== 'already_pending') {
         this.clearQueueInsertion(sessionId, state, result.status === 'unsupported'
           ? String('reason' in result && result.reason ? result.reason : 'runtime_unsupported')
