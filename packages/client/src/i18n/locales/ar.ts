@@ -2885,6 +2885,7 @@ export default {
       writeApprovalRemoveFile: 'هذه الموافقة تزيل {file} من المهارة {skill}.',
     },
     privacy: {
+      policy: 'إشعار الخصوصية',
       redactPii: 'حجب المعلومات الشخصية',
       redactPiiHint: 'كشف وإخفاء المعلومات الحساسة تلقائياً (كلمات المرور، المفاتيح، إلخ)',
     },

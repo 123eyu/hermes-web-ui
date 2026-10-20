@@ -2382,6 +2382,7 @@ jobTriggered: 'Job acionado',
       writeApprovalRemoveFile: 'Esta aprovação remove {file} do skill {skill}.',
     },
     privacy: {
+      policy: 'Aviso de privacidade',
       redactPii: 'Ocultar dados pessoais',
       redactPiiHint: 'Detectar e ocultar automaticamente informações sensíveis (senhas, chaves, etc.)',
     },

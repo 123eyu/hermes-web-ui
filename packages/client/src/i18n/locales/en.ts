@@ -2891,6 +2891,7 @@ export default {
       writeApprovalRemoveFile: 'This approval removes {file} from skill {skill}.',
     },
     privacy: {
+      policy: 'Privacy notice',
       redactPii: 'Redact PII',
       redactPiiHint: 'Auto-detect and hide sensitive info (passwords, keys, etc.)',
     },
