@@ -1,3 +1,4 @@
+import { downloadBrowserFile } from './browser-download'
 import { t } from '../desktop-i18n'
 import { realpathSync, mkdirSync } from 'node:fs'
 import { isAbsolute, relative } from 'node:path'
@@ -25,6 +26,17 @@ import { BrowserSessionCookieStore } from './browser-session-cookie-store'
 import { MAX_BROWSER_TABS } from './browser-types'
 import { BROWSER_BATCH_TIMEOUT_MS, parseBrowserBatchActions } from './browser-batch'
 import { observeBrowserState, type BrowserObservedState, type BrowserObservedTarget } from './browser-observation'
+import {
+  BrowserDownloadStore,
+  MAX_BROWSER_DOWNLOAD_BYTES,
+  fileNameFromResponse,
+  readLimitedBody,
+  type BrowserDownloadChunk,
+  type BrowserDownloadInfo,
+  type BrowserUploadFile,
+  type BrowserUploadMethod,
+  type BrowserUploadResult,
+} from './browser-files'
 import type {
   BrowserAgentControl,
   BrowserBatchResult,
@@ -38,6 +50,8 @@ import type {
   BrowserReadTextOptions,
   BrowserSnapshotOptions,
   BrowserSelection,
+  BrowserWaitOptions,
+  BrowserWaitResult,
   BrowserSitePermission,
   DesktopBrowserDownload,
   DesktopBrowserProfile,
@@ -103,6 +117,7 @@ export class BrowserManager {
   private tabMutationQueue: Promise<void> = Promise.resolve()
   private readonly downloads: DesktopBrowserDownload[] = []
   private readonly downloadItems = new Map<string, DownloadItem>()
+  private readonly agentDownloads = new BrowserDownloadStore()
   private readonly permissions: BrowserSitePermission[] = []
   private readonly browserSessions = new Map<string, Session>()
   private readonly sessionCookieStore = new BrowserSessionCookieStore()
@@ -542,6 +557,66 @@ export class BrowserManager {
       result.snapshotError = redactBrowserText(error instanceof Error ? error.message : String(error), 500)
     }
     return result
+  }
+
+  async upload(
+    tabId: string, snapshotId: string, ref: string, files: BrowserUploadFile[], method: BrowserUploadMethod,
+    assertActive: () => void = () => {},
+  ): Promise<BrowserInteractionResult & { upload: BrowserUploadResult }> {
+    assertActive()
+    const record = this.requireTab(tabId)
+    const before = this.automation.observedState(tabId)
+    const options = this.automation.snapshotSelection(tabId)
+    const generation = record.documentGeneration || 0
+    const tabs = new Set(this.records.keys())
+    return this.withAutomationView(record, async () => {
+      const upload = await this.automation.upload(tabId, record.view.webContents, snapshotId, ref, files, method, assertActive)
+      const evidence = await this.observeOperation(record, before, [], options, generation, tabs, assertActive)
+      return { ...copyTab(record.tab), ...evidence, upload }
+    })
+  }
+
+  async wait(tabId: string, options: BrowserWaitOptions, assertActive: () => void = () => {}): Promise<BrowserWaitResult> {
+    const record = this.requireTab(tabId)
+    return this.withAutomationView(record, () => this.automation.wait(tabId, record.view.webContents, options, () => {
+      assertActive()
+      if (this.records.get(tabId) !== record || record.view.webContents.isDestroyed()) throw new Error('Browser tab is closed')
+    }))
+  }
+
+  /** Fetch a link/media target with the tab's own session and hold it in memory for chunked reads. */
+  async downloadStart(tabId: string, source: { url?: string; snapshotId?: string; ref?: string }): Promise<BrowserDownloadInfo> {
+    const record = this.requireTab(tabId)
+    const contents = record.view.webContents
+    let url = source.url || ''
+    let suggested = ''
+    if (!url) {
+      if (!source.snapshotId || !source.ref) throw new Error('url or snapshot_id and ref are required')
+      ;({ url, fileName: suggested } = await this.automation.downloadSource(tabId, contents, source.snapshotId, source.ref))
+    } else if (!/^(?:blob|data):/i.test(url)) {
+      url = new URL(url, contents.getURL()).toString()
+    }
+    if (/^blob:/i.test(url)) {
+      const blob = await this.automation.readPageBlob(contents, url, MAX_BROWSER_DOWNLOAD_BYTES)
+      return this.agentDownloads.add(blob.data, { fileName: suggested || 'download', mimeType: blob.type, sourceUrl: 'blob:' })
+    }
+    if (/^data:/i.test(url)) {
+      const response = await fetch(url)
+      const data = await readLimitedBody(response, MAX_BROWSER_DOWNLOAD_BYTES)
+      return this.agentDownloads.add(data, { fileName: suggested || 'download', mimeType: (response.headers.get('content-type') || '').split(';')[0], sourceUrl: 'data:' })
+    }
+    // The tab session carries the page's cookies and proxy, so authenticated files download like a user click.
+    // Redirects are followed manually so every hop passes the same address policy as navigation.
+    const referer = /^https?:/i.test(contents.getURL()) ? `${new URL(contents.getURL()).origin}/` : undefined
+    const downloaded = await downloadBrowserFile(contents.session, url, referer)
+    return this.agentDownloads.add(downloaded.data, {
+      fileName: fileNameFromResponse(downloaded.url, downloaded.contentDisposition, suggested),
+      mimeType: downloaded.mimeType, sourceUrl: publicBrowserUrl(downloaded.url),
+    })
+  }
+
+  downloadRead(downloadId: string, offset: number): BrowserDownloadChunk {
+    return this.agentDownloads.read(downloadId, offset)
   }
 
   async screenshot(tabId: string, fullPage = false) {
