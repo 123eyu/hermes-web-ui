@@ -103,6 +103,12 @@ async function setup(page: Page, mode: 'light' | 'dark', wallpaper = true, custo
       state.tasks[0].revision++
       return route.fulfill({ json: { task: state.tasks[0] } })
     }
+    if (path.endsWith('/flows/apply')) {
+      const flow = state.flows.find((item: any) => item.id === body.flow_id)
+      if (body.expected_revision !== flow.revision) return route.fulfill({status:409,json:{error:'Flow changed'}})
+      flow.state = body.action === 'stop' ? 'stopped' : 'active'; flow.revision++
+      return route.fulfill({json:flow})
+    }
     if (path.endsWith('/schedules/apply')) {
       if (body.action === 'create') state.schedules.push({ ...body, id: `schedule${state.schedules.length + 1}`, state: 'active', next_at: Date.now() + 86400000, revision: 0 })
       else {
@@ -125,6 +131,111 @@ async function setup(page: Page, mode: 'light' | 'dark', wallpaper = true, custo
   })
   return { state, operations }
 }
+
+async function setupSessionModels(page: Page) {
+  const { state, operations } = await setup(page, 'light', false, false)
+  const second = { ...state.session, id: 'person-main-second', title: 'Second' }
+  state.conversations.push(second)
+  await page.addInitScript(id => {
+    (window as any).__PW_CHAT_SOCKET_RESUMES__[id] = { session_id: id, messages: [], isWorking: false, events: [] }
+  }, second.id)
+  const models = new Map(state.conversations.map((session: any) => [session.id, {
+    model: structuredClone(state.settings.model), reasoningEffort: 'low', inherits: true,
+  }])) as Map<string, { model: any; reasoningEffort: string; inherits: boolean }>
+  function snapshot(id: string) {
+    const selected = models.get(id)!
+    return { ...state, settings: { ...state.settings, model: selected.model, reasoningEffort: selected.reasoningEffort },
+      inherits_global_model: selected.inherits, reasoning_efforts: selected.model.model === 'fast-model' ? [] : ['none', 'low', 'high'],
+      session: { ...state.conversations.find((session: any) => session.id === id), model: selected.model.model, provider: selected.model.provider, reasoning_effort: selected.reasoningEffort }, tasks: [], schedules: [] }
+  }
+  await page.route(/\/api\/studio\/person(?:\?.*)?$/, route => {
+    const id = new URL(route.request().url()).searchParams.get('session_id')
+    return id && models.has(id) ? route.fulfill({ json: snapshot(id) }) : route.fallback()
+  })
+  await page.route('**/api/studio/person/settings', async route => {
+    const body = route.request().postDataJSON()
+    operations.push({ path: '/api/studio/person/settings', body })
+    const selected = models.get(body.session_id)
+    if (!selected) return route.fulfill({ status: 400, json: { error: 'session_id is required' } })
+    await state.beforeModelSave?.(body)
+    if (body.expected_revision !== state.revision) return route.fulfill({ status: 409, json: { error: 'Settings changed' } })
+    if (body.model) { selected.model = body.model; selected.inherits = false; selected.reasoningEffort = body.model.model === 'fast-model' ? '' : 'low' }
+    if (body.reasoning_effort !== undefined) selected.reasoningEffort = body.reasoning_effort
+    if (body.use_global_default) { selected.model = structuredClone(state.settings.model); selected.inherits = true; selected.reasoningEffort = 'low' }
+    state.revision++
+    const { session, ...result } = snapshot(body.session_id)
+    return route.fulfill({ json: result })
+  })
+  return { state, operations, models, second }
+}
+
+async function switchPersonSession(page: Page, id: string) {
+  await page.evaluate(id => { window.location.hash = `/person?session=${id}` }, id)
+  await expect(page.locator('.person-view')).toHaveAttribute('aria-busy', 'false')
+  await expect(page.locator('.input-model-button')).toBeVisible()
+}
+
+test('Person session models and efforts stay independent across switching, refresh and sending', async ({ page }) => {
+  const { models, second, operations } = await setupSessionModels(page)
+  await page.goto('/#/person?session=person-main-1')
+  await page.locator('.input-model-button').click()
+  await page.locator('.model-cascader:visible').getByRole('menuitemradio').filter({ hasText: 'fast-model' }).click()
+  await expect(page.locator('.input-model-button')).toHaveAttribute('aria-label', 'fast-model')
+  await switchPersonSession(page, second.id)
+  await expect(page.locator('.input-model-button')).toHaveAttribute('aria-label', 'global-model')
+  await page.locator('.reasoning-effort-button').click()
+  await page.getByRole('slider').focus(); await page.keyboard.press('ArrowRight')
+  await expect.poll(() => models.get(second.id)?.reasoningEffort).toBe('high')
+  await page.keyboard.press('Escape')
+  await switchPersonSession(page, 'person-main-1')
+  await expect(page.locator('.input-model-button')).toHaveAttribute('aria-label', 'fast-model')
+  await page.reload()
+  await expect(page.locator('.input-model-button')).toHaveAttribute('aria-label', 'fast-model')
+  await page.locator('.input-model-button').click()
+  await page.getByRole('button', { name: 'Use global default model', exact: true }).click()
+  await expect(page.locator('.reasoning-effort-button')).toHaveAttribute('aria-label', /low/i)
+  await switchPersonSession(page, second.id)
+  await expect(page.locator('.reasoning-effort-button')).toHaveAttribute('aria-label', /high/i)
+  await page.reload()
+  await expect(page.locator('.reasoning-effort-button')).toHaveAttribute('aria-label', /high/i)
+  await page.locator('.input-textarea').fill('Check this conversation')
+  await page.getByRole('button', { name: 'Send', exact: true }).click()
+  await expect.poll(() => emitted(page, 'run')).toEqual([expect.objectContaining({ session_id: second.id, model: 'global-model', reasoning_effort: 'high' })])
+  expect(operations.filter(op => op.path.endsWith('/settings')).map(op => op.body.session_id)).toEqual(['person-main-1', second.id, 'person-main-1'])
+})
+
+test('Person session switch clears optimistic effort while another session save is pending', async ({ page }) => {
+  const { state, models, second } = await setupSessionModels(page)
+  let release!: () => void
+  const pending = new Promise<void>(resolve => { release = resolve })
+  let started = false
+  state.beforeModelSave = async () => { started = true; await pending }
+  await page.goto('/#/person?session=person-main-1')
+  await page.locator('.reasoning-effort-button').click()
+  await page.getByRole('slider').focus(); await page.keyboard.press('ArrowRight')
+  await expect.poll(() => started).toBe(true)
+  await expect(page.locator('.reasoning-effort-button')).toHaveAttribute('aria-label', /high/i)
+  await page.keyboard.press('Escape')
+  try {
+    await switchPersonSession(page, second.id)
+    await expect(page.locator('.reasoning-effort-button')).toHaveAttribute('aria-label', /low/i)
+  } finally { release() }
+  await expect.poll(() => models.get('person-main-1')?.reasoningEffort).toBe('high')
+  await expect(page.locator('.input-model-button')).toBeEnabled()
+  await expect(page.locator('.reasoning-effort-button')).toHaveAttribute('aria-label', /low/i)
+  await switchPersonSession(page, 'person-main-1')
+  await expect(page.locator('.reasoning-effort-button')).toHaveAttribute('aria-label', /high/i)
+})
+
+test('Person session switch closes a model picker opened for the previous session', async ({ page }) => {
+  const { second, operations } = await setupSessionModels(page)
+  await page.goto('/#/person?session=person-main-1')
+  await page.locator('.input-model-button').click()
+  await expect(page.locator('.model-cascader:visible')).toBeVisible()
+  await switchPersonSession(page, second.id)
+  await expect(page.locator('.model-cascader:visible')).toHaveCount(0)
+  expect(operations.filter(op => op.path.endsWith('/settings'))).toEqual([])
+})
 
 test('Person events use the existing global question notification and open the main window',async({page})=>{
   await setup(page,'light',false,false)
@@ -296,7 +407,7 @@ test('Person general settings save independently, survive refresh and retain dra
   await expect(panel.getByRole('textbox', { name: 'Compression Threshold' })).toHaveValue('60')
   await save.click()
   await expect(panel.getByRole('status')).toHaveText('Settings saved')
-  expect(operations.filter(op => op.path.endsWith('/settings')).at(-1).body).toEqual({ compressionThreshold: 0.6, maxSteps: 20, maxConcurrentTasks: 3, timezone: 'Asia/Shanghai', expected_revision: 0 })
+  expect(operations.filter(op => op.path.endsWith('/settings')).at(-1).body).toEqual({ compressionThreshold: 0.6, maxSteps: 20, maxConcurrentTasks: 3, timezone: 'Asia/Shanghai', session_id: 'person-main-1', expected_revision: 0 })
   expect(state.settings.agents).toEqual(originalAgents)
   expect(state.settings.model.model).toBe('global-model')
   await page.reload()
@@ -324,7 +435,7 @@ test('Person general settings preserve edits on conflicts and prevent writes dur
   await expect(panel.getByRole('status')).toHaveText('Unsaved changes')
   await save.click()
   await expect(panel.getByRole('status')).toHaveText('Settings saved')
-  expect(operations.filter(op => op.path.endsWith('/settings')).at(-1).body).toEqual({ compressionThreshold: 0.65, expected_revision: 1 })
+  expect(operations.filter(op => op.path.endsWith('/settings')).at(-1).body).toEqual({ compressionThreshold: 0.65, session_id: 'person-main-1', expected_revision: 1 })
   await panel.getByRole('textbox', { name: 'Maximum steps per reply' }).fill('')
   await panel.getByRole('textbox', { name: 'Maximum steps per reply' }).press('Tab')
   await expect(save).toBeDisabled()
@@ -364,7 +475,7 @@ test('Person compression follows the interaction model and can restore the globa
   await expect(panel.getByRole('textbox', { name: 'Compression Threshold' })).toHaveValue('70')
   await expect(panel.getByRole('textbox', { name: 'Compression Threshold' })).toBeDisabled()
   await expect(panel).toContainText('89,600 tokens')
-  expect(operations.filter(op => op.path.endsWith('/settings')).at(-1).body).toEqual({ compressionThreshold: null, expected_revision: 2 })
+  expect(operations.filter(op => op.path.endsWith('/settings')).at(-1).body).toEqual({ compressionThreshold: null, session_id: 'person-main-1', expected_revision: 2 })
 })
 
 for (const mode of ['light', 'dark'] as const) {
@@ -432,11 +543,11 @@ for (const mode of ['light', 'dark'] as const) {
   }
 }
 
-for (const { locale, title, width } of [
-  { locale: 'zh', title: '个人助理', width: 1280 },
-  { locale: 'zh', title: '个人助理', width: 390 },
-  { locale: 'ja', title: 'パーソナルアシスタント', width: 390 },
-  { locale: 'ar', title: 'المساعد الشخصي', width: 390 },
+for (const { locale, title, width, executing } of [
+  { locale: 'zh', title: '个人助理', width: 1280, executing: '正在执行' },
+  { locale: 'zh', title: '个人助理', width: 390, executing: '正在执行' },
+  { locale: 'ja', title: 'パーソナルアシスタント', width: 390, executing: '実行中' },
+  { locale: 'ar', title: 'المساعد الشخصي', width: 390, executing: 'جارٍ التنفيذ' },
 ]) {
   test(`localizes the assistant title and keeps zhezhe's identity in ${locale} at ${width}px`, async ({ page }) => {
     const { state } = await setup(page, 'light', false)
@@ -454,6 +565,12 @@ for (const { locale, title, width } of [
       return bounds.left >= 0 && bounds.right <= innerWidth
     })).toBe(true)
     await page.screenshot({ path: `/tmp/person-interface-${locale}-${width}.png`, animations: 'disabled' })
+    await emit(page, 'run.started', { run_id: 'localized-run', autonomous: true })
+    await emit(page, 'reasoning.delta', { delta: 'Internal reasoning.' })
+    await expect(page.locator('.thinking-status-label')).toHaveText(executing)
+    await expect(page.locator('.thinking-status-label')).toBeVisible()
+    await expect(page.locator('.live-reasoning-detail')).toHaveCount(0)
+    await page.screenshot({ path: `/tmp/person-executing-${locale}-${width}.png`, animations: 'disabled' })
   })
 }
 
@@ -484,7 +601,9 @@ for (const mode of ['light', 'dark'] as const) {
     await expect(page.locator('.thinking-avatar')).toHaveAttribute('src', '/person/thinking.gif')
     await expect.poll(() => page.locator('.thinking-avatar').evaluate((img: HTMLImageElement) => img.complete && img.naturalWidth > 0)).toBe(true)
     await emit(page, 'reasoning.delta', { delta: 'Checking the task requirements.' })
-    await expect(page.locator('.live-reasoning-detail')).toContainText('Checking the task requirements.')
+    await expect(page.locator('.thinking-status-label')).toHaveText('Executing')
+    await expect(page.locator('.live-reasoning-detail')).toHaveCount(0)
+    await expect(page.getByText('Checking the task requirements.', { exact: true })).toHaveCount(0)
     await page.mouse.move(600, 30)
     await page.locator('.thinking-avatar').scrollIntoViewIfNeeded()
     await page.screenshot({ path: `/tmp/person-animation-thinking-${mode}.png`, animations: 'disabled' })
@@ -495,6 +614,7 @@ for (const mode of ['light', 'dark'] as const) {
     await emit(page, 'run.completed', { run_id: 'person-run', output: 'I will follow up on your task.' })
     await expect(page.locator('.streaming-indicator .thinking-status')).toHaveCount(0)
     await expect(page.getByText('I will follow up on your task.')).toBeVisible()
+    await expect(page.locator('.thinking-block')).toHaveCount(0)
     await expect(page.locator('.tool-run-card')).toHaveCount(0)
     await expect(page.getByText('bot_tasks_query', { exact: true })).toHaveCount(0)
     await expect(page.locator('.assistant-message-author .message-author-name')).toHaveText('zhezhe')
@@ -646,7 +766,7 @@ for (const mode of ['light', 'dark'] as const) {
 }
 
 for (const mode of ['light', 'dark'] as const) {
-  test(`Person shows a durable task return card above usage and opens the task drawer in ${mode}`, async ({ page }) => {
+  test(`Person keeps task results without usage or reasoning and opens the task drawer in ${mode}`, async ({ page }) => {
     const { state } = await setup(page, mode, false, false)
     state.tasks[0].running = false
     state.tasks[0].status = 'completed'
@@ -667,12 +787,13 @@ for (const mode of ['light', 'dark'] as const) {
     await expect(card.getByRole('status')).toHaveText('Completed')
     await expect(card.getByRole('img', { name: mode === 'light' ? 'Codex' : 'Ekko' })).toBeVisible()
     await expect(card).toContainText('Check report')
-    expect(await card.evaluate(element => element.nextElementSibling?.classList.contains('run-usage-card'))).toBe(true)
+    await expect(page.locator('.run-usage-card')).toHaveCount(0)
     await page.addInitScript(({ receipt, usage }) => {
       (window as any).__PW_CHAT_SOCKET_RESUMES__['person-main-1'] = {
         session_id: 'person-main-1', isWorking: false, events: [], messages: [
           { id: 40, role: 'assistant', content: 'Unrelated reply', timestamp: 1 },
-          { id: 42, role: 'assistant', content: 'Your report is ready.', timestamp: 2, person_task_return: receipt, run_usage: usage },
+          { id: 42, role: 'assistant', content: '<think>Private analysis.</think>Your report is ready.', reasoning: 'Reviewing the report.', timestamp: 2, person_task_return: receipt, run_usage: usage },
+          { id: 43, role: 'assistant', content: '<think>Private analysis only.</think>', timestamp: 3, run_usage: { ...usage, assistantMessageId: '43' } },
         ],
       }
       ;(window as any).__PW_CHAT_SOCKET_RESUMES__['person-task-task1'] = {
@@ -682,7 +803,10 @@ for (const mode of ['light', 'dark'] as const) {
     await page.reload()
     await expect(card).toHaveCount(1)
     await expect(card).toBeVisible()
-    expect(await card.evaluate(element => element.nextElementSibling?.classList.contains('run-usage-card'))).toBe(true)
+    await expect(page.locator('.run-usage-card, .thinking-block')).toHaveCount(0)
+    await expect(page.getByText('Your report is ready.', { exact: true })).toBeVisible()
+    await expect(page.getByText(/Private analysis|Reviewing the report/)).toHaveCount(0)
+    await expect(page.locator('.message.assistant')).toHaveCount(2)
     await page.locator('.person-compose .input-textarea').fill('Keep draft')
     await page.screenshot({ path: `/tmp/person-return-card-${mode}.png`, animations: 'disabled' })
     const details = card.locator('details')
@@ -1262,82 +1386,39 @@ for (const width of [1440, 390]) {
 }
 
 for (const width of [1440, 390]) {
-  test(`Person requires a saved Agent preset before chatting at ${width}px`, async ({ page }) => {
+  test(`Person chats without a background Agent preset at ${width}px`, async ({ page }) => {
     const { state } = await setup(page, 'light', false, false)
     state.settings.agents = []
     await page.setViewportSize({ width, height: 900 })
     await page.goto('/#/person')
-    const dialog = page.getByRole('dialog', { name: 'Set up your first Agent' })
-    await expect(dialog).toBeVisible()
-    await expect(dialog).toHaveCSS('width', `${Math.min(420, width - 32)}px`)
-    await expect(dialog).toHaveCSS('padding', '32px')
-    await expect(page.locator('.person-header-actions').getByRole('button')).toHaveCount(4)
-    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled()
-    await page.keyboard.press('Escape')
-    await expect(dialog).toBeVisible()
-    await page.screenshot({ path: `/tmp/person-agent-setup-${width}.png`, animations: 'disabled' })
-    await dialog.getByRole('button', { name: 'Go to settings' }).click()
-    await expect(dialog).not.toBeVisible()
-    const drawer = page.locator('.person-workspace-drawer')
-    await expect(drawer.getByRole('tab', { name: /Agent/ })).toHaveAttribute('aria-selected', 'true')
-    await expect(drawer.getByText('No Agents yet', { exact: true })).toBeVisible()
-    await expect(drawer.locator('.agent-card')).toHaveCount(0)
-    await expect(drawer.locator('.panel-count strong')).toHaveText('0')
-    await page.screenshot({ path: `/tmp/person-agent-setup-drawer-${width}.png`, animations: 'disabled' })
-    await drawer.getByRole('button', { name: 'Add agent', exact: true }).click()
-    await expect(drawer.locator('.runtime-option[aria-pressed=true]')).toHaveCount(0)
-    await expect(drawer.getByRole('button', { name: 'Save', exact: true })).toBeDisabled()
-    await drawer.getByRole('textbox', { name: 'Agent name', exact: true }).fill('My research partner')
-    await drawer.getByRole('textbox', { name: 'Purpose', exact: true }).fill('Research and write reports')
-    await drawer.getByRole('button', { name: 'Codex', exact: true }).click()
-    await drawer.locator('.scoped-model-selector button').click()
-    await page.getByRole('menuitemradio').filter({ hasText: 'global-model' }).click()
-    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled()
-    // Trigger Enter directly on the composer while the drawer covers it: drafts must not unlock send.
-    await page.locator('.input-textarea').fill('Not configured yet', { force: true })
-    await page.locator('.input-textarea').dispatchEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true })
-    expect(await emitted(page, 'run')).toEqual([])
-    state.revision++
-    await drawer.getByRole('button', { name: 'Save', exact: true }).click()
-    await expect(drawer.locator('.n-alert')).toContainText('Settings changed')
-    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled()
-    await expect(drawer.getByRole('textbox', { name: 'Agent name', exact: true })).toHaveValue('My research partner')
-    await drawer.getByRole('button', { name: 'Save', exact: true }).click()
-    await expect(drawer.locator('.agent-card')).toHaveCount(1)
-    await page.keyboard.press('Escape')
-    await expect(drawer).not.toBeVisible()
-    await expect(dialog).not.toBeVisible()
+    await expect(page.locator('.person-title')).toBeVisible()
+    await expect(page.getByRole('dialog', { name: 'Set up your first Agent' })).not.toBeVisible()
+    await page.locator('.input-textarea').fill('Continue the idiom game')
     await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled()
     await page.getByRole('button', { name: 'Send', exact: true }).click()
     await expect.poll(() => emitted(page, 'run')).toHaveLength(1)
     await page.reload()
     await expect(page.locator('.person-title')).toBeVisible()
-    await expect(dialog).not.toBeVisible()
-    await page.locator('.person-header-actions').getByRole('button', { name: 'Settings', exact: true }).click()
-    await drawer.getByRole('tab', { name: /^Agents/ }).click()
-    await drawer.getByRole('button', { name: 'Delete', exact: true }).click()
-    expect(state.settings.agents).toHaveLength(1)
-    await drawer.locator('.person-agent-settings').getByRole('button', { name: 'Save', exact: true }).click()
-    await expect.poll(() => state.settings.agents.length).toBe(0)
+    await page.getByRole('button', { name: 'Go to settings', exact: true }).click()
+    const drawer = page.locator('.person-workspace-drawer')
+    await expect(drawer.getByText('No Agents yet', { exact: true })).toBeVisible()
     await page.keyboard.press('Escape')
-    await expect(dialog).toBeVisible()
-    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled()
-    await page.reload()
-    await expect(dialog).toBeVisible()
+    await page.locator('.input-textarea').fill('Another turn')
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled()
   })
 }
 
 for (const { width, mode } of [{ width: 1440, mode: 'light' }, { width: 390, mode: 'dark' }] as const) {
-  test(`previews the first Agent setup in Chinese in ${mode} at ${width}px`, async ({ page }) => {
+  test(`previews optional Agent settings in Chinese in ${mode} at ${width}px`, async ({ page }) => {
     const { state } = await setup(page, mode, false, false)
     state.settings.agents = []
     await page.addInitScript(() => localStorage.setItem('hermes_locale', 'zh'))
     await page.setViewportSize({ width, height: 900 })
     await page.goto('/#/person')
-    const dialog = page.getByRole('dialog', { name: '先配置你的第一个 Agent' })
-    await expect(dialog).toBeVisible()
+    await expect(page.locator('.person-title')).toBeVisible()
+    await expect(page.getByRole('dialog', { name: '先配置你的第一个 Agent' })).not.toBeVisible()
     await page.screenshot({ path: `/tmp/person-agent-setup-zh-${mode}-${width}.png`, animations: 'disabled' })
-    await dialog.getByRole('button', { name: '去设置' }).click()
+    await page.getByRole('button', { name: '去设置', exact: true }).click()
     await expect(page.locator('.person-workspace-drawer .panel-empty')).toBeVisible()
     await page.screenshot({ path: `/tmp/person-agent-setup-drawer-zh-${mode}-${width}.png`, animations: 'disabled' })
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
@@ -1345,14 +1426,11 @@ for (const { width, mode } of [{ width: 1440, mode: 'light' }, { width: 390, mod
 }
 
 for (const mode of ['light', 'dark'] as const) {
-  test(`Person setup dialog and empty cards follow wallpaper and regional themes in ${mode}`, async ({ page }) => {
+  test(`Person optional Agent cards follow wallpaper and regional themes in ${mode}`, async ({ page }) => {
     const { state } = await setup(page, mode)
     state.settings.agents = []
     await page.goto('/#/person')
-    const dialog = page.locator('.person-setup-dialog')
-    await expect(dialog).toBeVisible()
-    await expect(dialog).toHaveCSS('background-color', /rgba\(.+, 0\.5\)/)
-    await dialog.getByRole('button', { name: 'Go to settings' }).click()
+    await page.getByRole('button', { name: 'Go to settings', exact: true }).click()
     const empty = page.locator('.person-agent-settings .panel-empty')
     await expect(empty).toHaveCSS('background-color', /rgba\(.+, 0\.65\)/)
     await expect(empty).toHaveCSS('backdrop-filter', 'blur(12px) saturate(1.1)')
@@ -1363,10 +1441,7 @@ for (const mode of ['light', 'dark'] as const) {
       } }) })
     })
     await page.reload()
-    await expect(dialog).toHaveCSS('background-color', 'rgba(51, 102, 153, 0)')
-    await expect(dialog).toHaveCSS('opacity', '1')
-    await expect(dialog).toHaveCSS('border-radius', '18px')
-    await dialog.getByRole('button', { name: 'Go to settings' }).click()
+    await page.getByRole('button', { name: 'Go to settings', exact: true }).click()
     await expect(empty).toHaveCSS('background-color', 'rgba(51, 102, 153, 0)')
     await expect(empty).toHaveCSS('opacity', '1')
     await expect(empty).toHaveCSS('border-radius', '18px')
@@ -1374,8 +1449,7 @@ for (const mode of ['light', 'dark'] as const) {
       await fetch('/api/theme', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ background: null, appearance: { global: {}, regions: {} } }) })
     })
     await page.reload()
-    await expect(dialog).toHaveCSS('background-color', mode === 'light' ? 'rgb(255, 255, 255)' : 'rgb(42, 42, 42)')
-    await dialog.getByRole('button', { name: 'Go to settings' }).click()
+    await page.getByRole('button', { name: 'Go to settings', exact: true }).click()
     await expect(empty).toHaveCSS('background-color', mode === 'light' ? 'rgb(255, 255, 255)' : 'rgb(42, 42, 42)')
   })
 }
@@ -2014,3 +2088,33 @@ test('Person shows an empty state after deleting its last conversation and creat
   await expect(page.locator('.input-textarea')).toBeVisible()
   await page.screenshot({ path: '/tmp/person-multi-session-mobile.png', animations: 'disabled' })
 })
+
+for (const width of [1440, 390]) {
+  test(`Person shows pure dialogue results and controls a flow without worker tasks at ${width}px`, async ({ page }) => {
+    const { state, operations } = await setup(page, 'light', false, false)
+    state.settings.agents=[]; state.tasks=[]
+    state.flows=[{id:'flow1',title:'Idiom chain',goal:'Each role adds one idiom',state:'active',revision:0,current_position:1,error:'',stages:[
+      {id:'stage1',session_id:'person-main-1',session_title:'First role',goal:'Start the chain',state:'completed',result_message_id:7,tasks:[]},
+      {id:'stage2',session_id:'person-main-1',session_title:'Second role',goal:'Add an idiom',state:'active',result_message_id:null,tasks:[]},
+    ]}]
+    await page.setViewportSize({width,height:900})
+    await page.goto('/#/person')
+    await page.locator('.person-header-actions').getByRole('button',{name:'Settings',exact:true}).click()
+    const drawer=page.locator('.person-workspace-drawer')
+    await drawer.getByRole('tab',{name:'Flows',exact:true}).click()
+    await expect(drawer.getByRole('heading',{name:'Idiom chain'})).toBeVisible()
+    await expect(drawer.getByText('First role',{exact:true})).toBeVisible()
+    await expect(drawer.getByRole('button',{name:'View result',exact:true})).toBeVisible()
+    await drawer.getByRole('button',{name:'Stop flow',exact:true}).click()
+    await expect(drawer.getByRole('button',{name:'Resume',exact:true})).toBeVisible()
+    await drawer.getByRole('button',{name:'Resume',exact:true}).click()
+    await expect(drawer.getByRole('button',{name:'Stop flow',exact:true})).toBeVisible()
+    expect(operations.filter(op=>op.path.endsWith('/flows/apply')).map(op=>op.body.action)).toEqual(['stop','resume'])
+    expect(operations.some(op=>op.path.endsWith('/tasks/apply'))).toBe(false)
+    await page.screenshot({path:`/tmp/person-flow-${width}.png`,animations:'disabled'})
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+    await drawer.getByRole('button',{name:'View result',exact:true}).click()
+    await expect(page).toHaveURL(/session=person-main-1&message=7/)
+    await expect(drawer).not.toBeVisible()
+  })
+}

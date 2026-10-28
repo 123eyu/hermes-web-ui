@@ -4,16 +4,47 @@
 
 Person conversations have independent generated `person-main-<uuid>` IDs and user-supplied names. Single chat and Person share the `SessionListSidebar` container for sizing, collapse, scrolling, themed surfaces and mobile drawer placement, as well as navigation, list rows and search UI. On mobile, switching between Chat and Person keeps both navigation columns open; selecting a conversation, opening search or naming a new conversation closes the drawer. Its search endpoint reads only the authenticated account's Person conversation names and messages; ordinary chats and task worker sessions are excluded. Creating a conversation never derives its ID from the account. An empty account shows a naming action instead of creating a fixed conversation implicitly.
 
-Memory, Agent presets and execution settings remain account-scoped. Main requests include the current conversation identity; `bot_sessions_query` discovers other owned conversations. History search covers the account's Person conversations and carries each original's conversation ID and name. Recent dialogue remains local to the current conversation. One account-wide message boundary is captured before the current input is persisted, and edits/deletion of any captured source fence subsequent tools and requests. Indexing retains a 64-chunk bound across sources per pass.
+Model selection and reasoning effort are stored only in `person_conversation_settings`, keyed by the owned session ID. Setting a model, changing effort or restoring the global model requires `session_id`; unscoped writes are rejected. Unconfigured conversations use the Studio global default, never another Person conversation's selection. Obsolete account model/effort/context-budget fields are discarded at initialization without migration; existing conversation settings and history remain intact.
 
-Every Person task has a required owning `session_tasks.session_id`. New work defaults to the current conversation and accepts an explicit owned `session_id` for cross-conversation assignment. Continuing a task preserves its task, runtime conversation and owner. The task's owning conversation is authoritative for initial, continued and scheduled result delivery, even when another conversation supplied the instruction. Durable questions and completion links also target that conversation. Task and schedule drawers are filtered to the selected conversation.
+Memory, Agent presets and execution settings remain account-scoped. Each main turn includes the current conversation identity and the complete account-owned Person conversation directory (IDs and names), without search pagination. New turns reflect creation, renaming and deletion; conversations being deleted are excluded. Names are user-provided labels and do not define responsibilities, hierarchy or Agent bindings. `bot_sessions_query` remains available to search conversation content or refresh the directory during a turn. The directory is part of the system prompt and its context budget; it does not include message history. History search covers the account's Person conversations and carries each original's conversation ID and name. Recent dialogue remains local to the current conversation. One account-wide message boundary is captured before the current input is persisted, and edits/deletion of any captured source fence subsequent tools and requests. Indexing retains a 64-chunk bound across sources per pass.
+
+Every Person task has a required owning `session_tasks.session_id`. A model can create or adopt background work only in its current conversation; cross-role attempts fail with `ROLE_HANDOFF_REQUIRED` before Agent selection or task creation. Use `bot_flow_create` to let another role receive the request in its main conversation and choose its own execution needs. Continuing an existing task preserves its task, runtime conversation and owner. Existing legacy planned task flows can still transfer ownership using `advance`. The task's current owning conversation is authoritative for result delivery, even when another conversation supplied the follow-up instruction. Durable questions and completion links also target that conversation. Task and schedule drawers are filtered to the selected conversation.
+
+### Conversation stages and optional workers
+
+Use `bot_flow_create` for a fixed sequence of roles, including a single stage to relay a message to one recipient. Praise, greetings and word games are conversation, not background execution. Flows and stages are separate from background tasks: a stage can answer directly with zero executions, or choose its own configured Agent using `bot_agents_list` and `bot_task_create`. Main chat and pure dialogue stages need an available interaction model, but no execution Agent preset. New task tools no longer advertise the legacy `next_steps` contract; existing legacy task flows retain their compatibility path.
+
+```json
+{
+  "title": "Deliver a reviewed page",
+  "goal": "Prepare copy, implement it and report the result",
+  "stages": [
+    { "session_id": "person-main-copy", "goal": "Prepare page copy", "return_expectation": "Save approved copy" },
+    { "session_id": "person-main-code", "goal": "Implement the approved copy", "return_expectation": "Verify the page and save links" },
+    { "session_id": "person-main-boss", "goal": "Prepare final deliverables", "return_expectation": "Summarize for the user" }
+  ]
+}
+```
+
+The host fixes the creator from the originating conversation. Route data is immutable and bounded to 13 stages and 32,000 characters. Each stage first wakes its owning Person main conversation. Any optional worker gets a distinct task and hidden worker conversation; continuing that child preserves its Agent and conversation. Ownership never moves from one stage to another. Stage children cannot be scheduled for later recurrence.
+
+The directory entry marked `current:true` is the speaking role. A request naming that role is its own work. The service rejects a first destination equal to the creator and any consecutive equal destinations with `SELF_HANDOFF`, before persisting a flow or delivery. Comparisons use session IDs, not names; a later return after another role remains valid. Finish local work before handing its artifact to another role: a pending worker created in the same turn blocks flow creation with `WORK_PENDING`. For “programmer makes HTML, then copywriter reviews” inside the programmer conversation, the programmer starts its own worker once, waits for the artifact, then sends only the review to the copywriter. Worker result callbacks may continue handoffs already requested by the user; they do not authorize new work.
+
+`bot_flows_query` returns fresh revision-bound references. `bot_flow_control complete` prepares the active stage; it cannot complete another stage or leave unfinished workers. The host advances only after the final assistant result from that same run is successfully saved. Normal replies and worker completion alone do not advance a flow. Result references, the next active stage and its durable delivery record are committed together. Startup recovery reconciles a saved final result with an unfinished completion marker without repeating advancement. Failed, streamed, interrupted or truncated replies are not final stage results.
+
+Handoff instructions are transient model context (`displayInput: null`, no user-message write, no memory writes). Stages store original result message IDs, not copied output text. The next stage loads the previous result by reference, with a bounded excerpt and the original ID for further reads; the same ID is excluded from normal recalled evidence in that turn. Shared account recall remains available. For an idiom chain, history stores A, B and C once in their respective role conversations, without storing A→B or B→C handoff messages. Optional worker callbacks retain no copied originating transcript for stage tasks.
+
+The creator or current role can stop a flow. Stop cancels durable handoffs and worker callbacks, aborts only flow-tagged main turns and stops its child work. Other ordinary turns in those conversations keep their normal behavior. Late callbacks are fenced by the flow generation. Only the creator or authenticated account API can resume a stopped flow; this increments the generation and requeues the same stage after workers finish stopping. Replaying an old stop request cannot stop a resumed flow.
+
+The Person settings drawer includes a flow panel with stage status, result links, optional child conversations, and stop/resume controls. The account API exposes `/api/studio/person/flows/query` and `/flows/apply`. Completion is restricted to the trusted assigned model turn and cannot be forged through that API. Deleting any involved conversation stops its active flows; clearing history is blocked while an involved flow remains active. Missing original results leave a visible delivery error instead of silently reconstructing lost context.
 
 Deleting a conversation blocks new dispatch into it, cancels its schedules and result deliveries, interrupts queued/follow-up work and waits for active native workers and the main run to stop. Its messages, tasks, worker sessions, execution records, questions, schedules, return cards and derived context are then removed together. Shared memory, presets, workspace files and other conversations remain. A failed native stop leaves the conversation present so deletion can be retried. There is no legacy task reassignment: obsolete account-only tasks without an owning conversation are discarded at initialization.
 
 Person main chats use their own bounded history loader. Ordinary single chats,
 Person worker sessions and the shared `sessions` / `messages` schemas retain
-their existing behavior. The only shared run-path change skips the ordinary
-history compressor for `person-main-*`; Person's adapter supplies history.
+their existing behavior. The shared run path skips the ordinary history compressor for `person-main-*`;
+Person's adapter supplies history. Stage completion hooks activate only for
+trusted Person stage deliveries or their worker callbacks.
 There is no fallback to the old Person substring scan or shared compression
 snapshots.
 
