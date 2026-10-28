@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Locator, type Page } from '@playwright/test'
 import { authenticate, mockChatSocket, mockHermesApi } from './fixtures'
 import sharp from 'sharp'
 
@@ -12,11 +12,56 @@ async function setup(page: Page, mode: 'light' | 'dark', wallpaper = true, custo
   const globalModel = { model: 'global-model', provider: 'provider', profile: 'default' }
   const state: any = { settings: { workspace: '', model: globalModel, reasoningEffort: 'low', timezone: 'UTC', compressionThreshold: null, maxSteps: 12, maxConcurrentTasks: 2, agents: [{ id: 'worker', name: 'Research assistant', description: 'Research and write reports', selection: { runtime: 'ekko', mode: 'scoped', profile: 'default', provider: 'provider', model: 'global-model', reasoningEffort: '' } }] }, contextTokens: 200000, compression: { enabled: true, threshold: 0.5, globalThreshold: 0.5 }, inherits_global_model: true, reasoning_efforts: ['none', 'low', 'high'], revision: 0, busy: false, history_revision: 0, can_clear: false, tasks: [{ id: 'task1', title: 'Check report', summary: 'Verify a report', status: 'open', revision: 0, execution_id: 'execution1', execution_state: 'running', running: true }], schedules: [], memories: [], interactions: [] }
   state.session = { id: 'person-main-1', source: 'builtin_agent', agent: 'ekko-agent', agent_preset: 'person', agent_mode: 'scoped', profile: 'default', title: 'Person', workspace: '/tmp/person/default', model: 'global-model', provider: 'provider', started_at: 1, ended_at: null, message_count: 0, tool_call_count: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, reasoning_tokens: 0, billing_provider: null, estimated_cost_usd: 0, actual_cost_usd: null, cost_status: '' }
+  state.conversations = [state.session]
+  state.conversationMessages = {}
+  state.tasks[0].session_id = state.session.id
   await page.addInitScript(() => { (window as any).__PW_CHAT_SOCKET_RESUMES__ = { 'person-main-1': { session_id: 'person-main-1', messages: [], isWorking: false, events: [] } } })
   const operations: any[] = []
+  function removeConversation(id: string) {
+    state.conversations = state.conversations.filter((session: any) => session.id !== id)
+    const removedIds = new Set(state.tasks.filter((task: any) => task.session_id === id).map((task: any) => task.id))
+    state.tasks = state.tasks.filter((task: any) => !removedIds.has(task.id))
+    state.schedules = state.schedules.filter((schedule: any) => !removedIds.has(schedule.task_id))
+  }
+  await page.route('**/api/studio/sessions/batch-delete', route => {
+    const req = route.request(); const body = req.postDataJSON()
+    operations.push({ path: new URL(req.url()).pathname, body, headers: req.headers() })
+    if (state.failBatchRequest) return route.fulfill({ status: 500, json: { error: 'Batch unavailable' } })
+    const errors = body.ids.filter((id: string) => state.batchFailedIds?.includes(id)).map((id: string) => ({ id, error: 'Task stop failed' }))
+    for (const id of body.ids) if (!errors.some((error: any) => error.id === id)) removeConversation(id)
+    return route.fulfill({ json: { deleted: body.ids.length - errors.length, failed: errors.length, errors } })
+  })
+  await page.route('**/api/studio/sessions/*/rename', route => {
+    const req = route.request(); const path = new URL(req.url()).pathname; const body = req.postDataJSON()
+    operations.push({ path, body, headers: req.headers() })
+    if (state.failRename) return route.fulfill({ status: 500, json: { error: 'Rename failed' } })
+    const session = state.conversations.find((item: any) => item.id === decodeURIComponent(path.split('/').at(-2)!))
+    if (!session) return route.fulfill({ status: 404, json: { error: 'Conversation not found' } })
+    session.title = body.title
+    return route.fulfill({ json: { ok: true } })
+  })
   await page.route(/^https?:\/\/[^/]+\/api\/studio\/person(?:\/|\?|$)/, async route => {
     const req = route.request(); const path = new URL(req.url()).pathname; const body = req.postDataJSON()
     operations.push({ path, body, headers: req.headers() })
+    if (path.endsWith('/conversations')) {
+      if (req.method() === 'POST') {
+        const session = { ...state.session, id: `person-main-new-${operations.length}`, title: body.title, history_revision: 0 }
+        state.conversations.unshift(session)
+        await page.evaluate(sessionId => {
+          (window as any).__PW_CHAT_SOCKET_RESUMES__[sessionId] = { session_id: sessionId, messages: [], isWorking: false, events: [] }
+        }, session.id)
+        return route.fulfill({ json: session })
+      }
+      const query = new URL(req.url()).searchParams.get('search')?.toLowerCase() || ''
+      const sessions = state.conversations.filter((session: any) => !query || session.title.toLowerCase().includes(query) || (state.conversationMessages[session.id] || []).some((message: any) => message.content.toLowerCase().includes(query)))
+      return route.fulfill({ json: { sessions, next_offset: null } })
+    }
+    if (path.includes('/conversations/') && req.method() === 'DELETE') {
+      if (state.failDelete) return route.fulfill({ status: 409, json: { error: 'Conversation changed; reload and retry' } })
+      const id = decodeURIComponent(path.split('/').at(-1)!)
+      removeConversation(id)
+      return route.fulfill({ json: { deleted: true, session_id: id } })
+    }
     if (path.endsWith('/capabilities')) return route.fulfill({ json: { agents: [{ runtime: 'ekko', installed: true }, { runtime: 'codex', installed: true }], native_allowed: true } })
     if (path.endsWith('/models') || path.endsWith('/agent-models')) return route.fulfill({ json: { groups: [{ provider: 'provider', profile: 'default', label: 'My provider', models: ['global-model', 'fast-model'], model_meta: { 'global-model': { reasoning_efforts: ['none', 'low', 'high'] }, 'fast-model': { reasoning: false } } }] } })
     if (path.endsWith('/settings')) {
@@ -70,9 +115,13 @@ async function setup(page: Page, mode: 'light' | 'dark', wallpaper = true, custo
       return route.fulfill({ json: {} })
     }
     if (path.endsWith('/memory')) { state.memories = state.memories.filter((m: any) => m.id !== body.id); return route.fulfill({ json: {} }) }
+    const requested = new URL(req.url()).searchParams.get('session_id')
+    const selected = requested ? state.conversations.find((session: any) => session.id === requested) : null
+    if (requested && !selected) return route.fulfill({ status: 404, json: { error: 'Conversation not found' } })
     state.can_clear = !state.busy && !state.tasks.some((task: any) => task.running)
     state.session.model = state.settings.model?.model || ''; state.session.provider = state.settings.model?.provider || ''; state.session.reasoning_effort = state.settings.reasoningEffort
-    return route.fulfill({ json: state })
+    if (path.endsWith('/tasks/query')) return route.fulfill({ json: { tasks: state.tasks.filter((task: any) => !body.session_id || (task.session_id || state.session.id) === body.session_id) } })
+    return route.fulfill({ json: { ...state, session: selected, tasks: state.tasks.filter((task: any) => selected && (task.session_id || state.session.id) === selected.id), schedules: state.schedules.filter((schedule: any) => state.tasks.some((task: any) => task.id === schedule.task_id && (task.session_id || state.session.id) === selected?.id)) } })
   })
   return { state, operations }
 }
@@ -80,7 +129,7 @@ async function setup(page: Page, mode: 'light' | 'dark', wallpaper = true, custo
 test('Person events use the existing global question notification and open the main window',async({page})=>{
   await setup(page,'light',false,false)
   await page.goto('/#/person')
-  await expect(page.locator('.person-title')).toHaveText('Personal assistant')
+  await expect(page.locator('.person-title')).toHaveText('Person')
   await page.getByRole('link',{name:'Chat',exact:true}).click()
   await expect(page).toHaveURL(/#\/hermes\/chat$/)
   await expect.poll(()=>page.evaluate(()=>(window as any).__PW_CHAT_SOCKET__?.allSockets?.some((socket:any)=>String(socket.url).endsWith('/chat-run')))).toBe(true)
@@ -92,8 +141,8 @@ test('Person events use the existing global question notification and open the m
   await expect(title).toBeVisible()
   await expect(page.getByText('Choose the report scope',{exact:true})).toBeVisible()
   await title.click()
-  await expect(page).toHaveURL(/#\/person$/)
-  await expect(page.locator('.person-title')).toHaveText('Personal assistant')
+  await expect(page).toHaveURL(/#\/person\?session=person-main-1$/)
+  await expect(page.locator('.person-title')).toHaveText('Person')
 })
 
 async function backgroundTaskCount(page: Page, count: number, state = 'searching') {
@@ -390,7 +439,8 @@ for (const { locale, title, width } of [
   { locale: 'ar', title: 'المساعد الشخصي', width: 390 },
 ]) {
   test(`localizes the assistant title and keeps zhezhe's identity in ${locale} at ${width}px`, async ({ page }) => {
-    await setup(page, 'light', false)
+    const { state } = await setup(page, 'light', false)
+    state.session.title = title
     await page.addInitScript(value => localStorage.setItem('hermes_locale', value), locale)
     await page.setViewportSize({ width, height: 844 })
     await page.goto('/#/person')
@@ -412,7 +462,7 @@ for (const mode of ['light', 'dark'] as const) {
     const { state, operations } = await setup(page, mode)
     await page.goto('/#/person')
     const input = page.getByPlaceholder('Type a message... (Enter to send, Shift+Enter for new line)')
-    await expect(page.locator('.person-title')).toHaveText('Personal assistant')
+    await expect(page.locator('.person-title')).toHaveText('Person')
     await expect(page.locator('.input-settings-button')).toHaveCount(0)
     await expect(page.locator('.input-model-button')).toHaveAttribute('aria-label', 'global-model')
     await expect(page.getByRole('heading', { name: 'Choose a model' })).toHaveCount(0)
@@ -591,7 +641,7 @@ for (const mode of ['light', 'dark'] as const) {
     await page.screenshot({ path: `/tmp/person-animation-${mode}-mobile.png`, animations: 'disabled' })
     await expect.poll(() => page.evaluate(() => (window as any).__PW_CHAT_SOCKET__.emitted.some((event: any) => event.event === 'person.activity'))).toBe(true)
     await page.getByRole('link', { name: 'Your account assistant', exact: true }).click()
-    await expect(page.locator('.studio-mobile-drawer')).not.toBeVisible()
+    await expect(page.locator('.studio-mobile-drawer .person-sidebar .session-item')).toBeVisible()
   })
 }
 
@@ -737,6 +787,28 @@ test('Person saves agent presets, preserves unsaved edits and only offers openin
   await page.screenshot({ path: '/tmp/person-tasks-mobile.png', animations: 'disabled' })
   expect(operations.filter(op => op.path.endsWith('/tasks/apply')).map(op => op.body.action)).toEqual(['close', 'reopen'])
 })
+
+for (const [width, mode] of [[1440, 'light'], [390, 'dark']] as const) {
+  test(`Person task list shows the executing Agent avatar at ${width}px`, async ({ page }) => {
+    const { state } = await setup(page, mode, false, false)
+    state.tasks = ['hermes', 'ekko', 'claude-code'].map(runtime => ({ ...state.tasks[0], id: `task-${runtime}`,
+      title: `Work by ${runtime}`, execution_state: 'finished', running: false,
+      selection_json: JSON.stringify({ runtime, profile: 'default' }) }))
+    await page.setViewportSize({ width, height: 900 })
+    await page.goto('/#/person')
+    await page.getByRole('button', { name: 'Tasks', exact: true }).click()
+    const drawer = page.locator('.session-tasks-drawer')
+    await expect(drawer.locator('.task-row')).toHaveCount(3)
+    for (const [runtime, label, asset] of [['hermes', 'Hermes', 'hermes.png'], ['ekko', 'Ekko', 'ekko-agent.png'], ['claude-code', 'Claude', 'claude-code.svg']]) {
+      const row = drawer.locator('.task-row').filter({ hasText: `Work by ${runtime}` })
+      const source = row.locator(width === 390 ? '.mobile-source' : '.source-session')
+      if (width === 1440) await expect(source).toContainText(label)
+      await expect(source.locator('img')).toHaveAttribute('src', `/coding-agents/${asset}`)
+      await expect.poll(() => source.locator('img').evaluate((img: HTMLImageElement) => img.complete && img.naturalWidth > 0)).toBe(true)
+    }
+    await page.screenshot({ path: `/tmp/person-task-agent-avatars-${width}.png`, animations: 'disabled' })
+  })
+}
 
 for (const scenario of ['after-request', 'reconnect', 'idle-schedule'] as const) {
   test(`Person streams a background result to the main window (${scenario})`, async ({ page }) => {
@@ -1428,7 +1500,7 @@ for (const mode of ['light', 'dark'] as const) {
     await page.getByRole('button', { name: 'Confirm', exact: true }).click()
     await expect(page.getByText('Old Person conversation', { exact: true })).toHaveCount(0)
     await expect(page.getByText('Chat history and tasks cleared.', { exact: true })).toBeVisible()
-    expect(operations.filter(op => op.path.endsWith('/clear'))).toEqual([expect.objectContaining({ body: { expected_history_revision: 0 } })])
+    expect(operations.filter(op => op.path.endsWith('/clear'))).toEqual([expect.objectContaining({ body: { session_id: 'person-main-1', expected_history_revision: 0 } })])
     expect(state.tasks).toEqual([])
     expect(state.memories).toHaveLength(1)
     expect(state.settings.workspace).toBe('/workspace/person-shared')
@@ -1469,4 +1541,476 @@ test('Person preserves records when work starts after opening the clear confirma
   await expect(page.getByText('Keep the old conversation', { exact: true })).toBeVisible()
   expect(state.tasks).toHaveLength(1)
   expect(operations.filter(op => op.path.endsWith('/clear'))).toHaveLength(1)
+})
+
+
+for (const mode of ['light', 'dark'] as const) {
+  test(`Person creates named conversations, switches and deletes only the selected conversation in ${mode}`, async ({ page }) => {
+    const { state, operations } = await setup(page, mode, true, true)
+    state.tasks[0].running = false; state.tasks[0].execution_state = 'finished'
+    await page.goto('/#/person')
+    await expect(page.locator('.person-title')).toHaveText('Person')
+    await page.getByRole('button', { name: 'New conversation', exact: true }).click()
+    const dialog = page.getByRole('dialog').filter({ has: page.getByRole('textbox', { name: 'Conversation name' }) })
+    await dialog.getByRole('textbox', { name: 'Conversation name' }).fill('旅行计划')
+    await dialog.getByRole('button', { name: 'Create', exact: true }).click()
+    await expect(page.locator('.person-title')).toHaveText('旅行计划')
+    const created = state.conversations.find((session: any) => session.title === '旅行计划')
+    expect(created.id).not.toBe(state.session.id)
+    await expect(page).toHaveURL(new RegExp(`session=${created.id}`))
+    await expect(dialog).not.toBeVisible()
+    await expect(page.locator('.person-compose .input-textarea')).toBeVisible()
+    await page.screenshot({ path: `/tmp/person-multi-session-${mode}.png`, animations: 'disabled' })
+    await page.locator('.person-sidebar .session-item').filter({ hasText: 'Person' }).click()
+    await expect(page.locator('.person-title')).toHaveText('Person')
+    const row = page.locator('.person-sidebar .session-item').filter({ hasText: '旅行计划' })
+    await row.hover(); await row.locator('.session-item-delete').click()
+    await page.getByRole('button', { name: 'Confirm', exact: true }).click()
+    await expect(row).toHaveCount(0)
+    await expect(page.locator('.person-title')).toHaveText('Person')
+    expect(state.tasks.map((task: any) => task.id)).toEqual(['task1'])
+    expect(operations.some(operation => operation.path.endsWith(`/conversations/${created.id}`))).toBe(true)
+  })
+}
+
+async function longPressConversation(page: Page, row: Locator) {
+  await row.tap({ trial: true })
+  const box = (await row.boundingBox())!
+  const client = await page.context().newCDPSession(page)
+  try {
+    await client.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: box.x + box.width / 2, y: box.y + box.height / 2 }] })
+    await expect(page.locator('.n-dropdown-option:visible').filter({ hasText: /^Rename$/ })).toBeVisible()
+  } finally {
+    await client.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+    await client.detach()
+  }
+}
+
+test.describe('Person mobile conversation actions', () => {
+  test.use({ hasTouch: true, viewport: { width: 390, height: 844 } })
+
+  for (const mode of ['light', 'dark'] as const) {
+    test(`long-presses to rename and delete the target conversation in ${mode}`, async ({ page }) => {
+      const { state, operations } = await setup(page, mode, mode === 'dark', true)
+      const other = { ...state.session, id: 'person-main-travel', title: '旅行计划' }
+      state.conversations.push(other)
+      state.tasks.push({ ...state.tasks[0], id: 'travel-task', session_id: other.id, running: false, execution_state: 'finished' })
+      state.schedules.push({ id: 'travel-schedule', task_id: 'travel-task' })
+      await page.addInitScript(id => {
+        (window as any).__PW_CHAT_SOCKET_RESUMES__[id] = { session_id: id, messages: [], isWorking: false, events: [] }
+      }, other.id)
+      await page.goto('/#/person')
+      await expect(page.locator('.person-compose .input-textarea')).toBeVisible()
+      const sidebar = page.locator('.person-sidebar')
+      const menu = page.locator('.n-dropdown-option:visible')
+      const openSidebar = () => page.getByRole('button', { name: 'Menu', exact: true }).click()
+      await openSidebar()
+      await expect(sidebar.locator('.session-item-delete')).toHaveCount(0)
+      await sidebar.locator('.session-item').filter({ hasText: other.title }).tap()
+      await expect(page.locator('.person-title')).toHaveText(other.title)
+      await expect(page.locator('.studio-mobile-drawer')).toBeHidden()
+      await openSidebar()
+      await sidebar.locator('.session-item').filter({ hasText: 'Person' }).tap()
+      await expect(page.locator('.person-title')).toHaveText('Person')
+      await openSidebar()
+      await longPressConversation(page, sidebar.locator('.session-item').filter({ hasText: other.title }))
+      await expect(page.locator('.studio-mobile-drawer')).toBeVisible()
+      await expect(page).toHaveURL(/session=person-main-1$/)
+      await expect(menu).toHaveText(['Rename', 'Delete', 'Batch selection'])
+      await expect(menu.last()).toBeInViewport()
+      await page.screenshot({ path: `/tmp/person-session-touch-menu-${mode}.png`, animations: 'disabled' })
+      await menu.filter({ hasText: /^Rename$/ }).click()
+      const naming = page.getByRole('dialog').filter({ hasText: 'Rename Session' })
+      await expect(page.locator('.studio-mobile-drawer')).toBeHidden()
+      await expect(naming.getByRole('textbox', { name: 'Conversation name' })).toHaveValue('旅行计划')
+      await naming.getByRole('textbox').fill('   ')
+      await expect(naming.getByRole('button', { name: 'OK', exact: true })).toBeDisabled()
+      await naming.getByRole('textbox').fill('研究计划')
+      await page.screenshot({ path: `/tmp/person-session-touch-rename-${mode}.png`, animations: 'disabled' })
+      await naming.getByRole('textbox').press('Enter')
+      await expect(naming).toBeHidden()
+      await expect(page.locator('.person-title')).toHaveText('Person')
+      expect(operations.filter(op => op.path.endsWith('/rename')).map(op => [op.path, op.body.title]))
+        .toEqual([['/api/studio/sessions/person-main-travel/rename', '研究计划']])
+      await page.reload()
+      await expect(page.locator('.person-compose .input-textarea')).toBeVisible()
+      await openSidebar()
+      const renamed = sidebar.locator('.session-item').filter({ hasText: '研究计划' })
+      await expect(renamed).toBeVisible()
+      await longPressConversation(page, renamed)
+      await menu.filter({ hasText: /^Delete$/ }).click()
+      const confirmation = page.getByRole('dialog').filter({ hasText: 'Delete this session?' })
+      await expect(confirmation).toBeVisible()
+      await expect(confirmation).toContainText('tasks')
+      await confirmation.getByRole('button', { name: 'Cancel', exact: true }).click({ trial: true })
+      await confirmation.screenshot({ path: `/tmp/person-session-touch-delete-${mode}.png`, animations: 'disabled' })
+      await confirmation.getByRole('button', { name: 'Cancel', exact: true }).click()
+      expect(state.conversations).toHaveLength(2)
+      expect(operations.some(op => op.path.endsWith('/conversations/person-main-travel'))).toBe(false)
+      await openSidebar()
+      await longPressConversation(page, renamed)
+      await menu.filter({ hasText: /^Delete$/ }).click()
+      await confirmation.getByRole('button', { name: 'Confirm', exact: true }).click()
+      await expect(confirmation).toBeHidden()
+      await expect(page.locator('.person-title')).toHaveText('Person')
+      expect(state.tasks.map((task: any) => task.id)).toEqual(['task1'])
+      expect(state.schedules).toHaveLength(0)
+      await openSidebar()
+      await expect(renamed).toHaveCount(0)
+      await longPressConversation(page, sidebar.locator('.session-item'))
+      await menu.filter({ hasText: /^Rename$/ }).click()
+      await naming.getByRole('textbox').fill('工作安排')
+      await naming.getByRole('button', { name: 'OK', exact: true }).click()
+      await expect(page.locator('.person-title')).toHaveText('工作安排')
+      await expect(page).toHaveURL(/session=person-main-1$/)
+      await openSidebar()
+      await longPressConversation(page, sidebar.locator('.session-item'))
+      await menu.filter({ hasText: /^Delete$/ }).click()
+      await confirmation.getByRole('button', { name: 'Confirm', exact: true }).click()
+      await expect(page.getByText('Create a conversation to start chatting.')).toBeVisible()
+      expect(state.conversations).toHaveLength(0)
+      expect(state.tasks).toHaveLength(0)
+      await page.locator('.person-empty').getByRole('button', { name: 'New conversation' }).click()
+      await page.getByRole('textbox', { name: 'Conversation name' }).fill('新会话')
+      await page.getByRole('button', { name: 'Create', exact: true }).click()
+      await expect(page.locator('.person-title')).toHaveText('新会话')
+      expect(operations.filter(op => op.path === '/api/studio/person/conversations' && op.body?.title)).toHaveLength(1)
+    })
+  }
+})
+
+test.describe('Person batch conversation deletion', () => {
+  test.use({ hasTouch: true })
+  for (const [width, mode] of [[1440, 'light'], [390, 'dark']] as const) {
+    test(`selects conversations, preserves failures and retries deletion at ${width}px in ${mode}`, async ({ page }) => {
+      const { state, operations } = await setup(page, mode, mode === 'dark', true)
+      const second = { ...state.session, id: 'person-main-second', title: '第二个会话' }
+      const third = { ...state.session, id: 'person-main-third', title: '第三个会话' }
+      state.conversations.push(second, third)
+      state.tasks.push(...[second, third].map(session => ({ ...state.tasks[0], id: session.id, session_id: session.id })))
+      state.schedules.push(...[second, third].map(session => ({ id: session.id, task_id: session.id })))
+      state.failBatchRequest = true
+      state.batchFailedIds = [third.id]
+      await page.setViewportSize({ width, height: 900 })
+      await page.goto('/#/person')
+      await expect(page.locator('.person-compose .input-textarea')).toBeVisible()
+      if (width < 769) await page.getByRole('button', { name: 'Menu', exact: true }).click()
+      const sidebar = page.locator('.person-sidebar')
+      const toolbar = sidebar.locator('.session-list-toolbar')
+      const rows = sidebar.locator('.session-item')
+      const batchRequests = () => operations.filter(op => op.path === '/api/studio/sessions/batch-delete')
+      await sidebar.getByRole('button', { name: 'Session list actions', exact: true }).click()
+      await page.locator('.n-dropdown-option:visible').filter({ hasText: /^Batch selection$/ }).click()
+      await expect(toolbar).toContainText('0 selected')
+      await toolbar.getByRole('button', { name: 'Cancel', exact: true }).click()
+      await expect(toolbar).toHaveCount(0)
+      if (width < 769) {
+        await longPressConversation(page, rows.filter({ hasText: second.title }))
+        await page.locator('.n-dropdown-option:visible').filter({ hasText: /^Batch selection$/ }).click()
+        await expect(toolbar).toContainText('1 selected')
+        await rows.filter({ hasText: third.title }).click()
+      } else {
+        await sidebar.getByRole('button', { name: 'Session list actions', exact: true }).click()
+        await page.locator('.n-dropdown-option:visible').filter({ hasText: /^Batch selection$/ }).click()
+        await rows.filter({ hasText: second.title }).getByRole('checkbox').click()
+        await rows.filter({ hasText: third.title }).click()
+      }
+      await expect(toolbar).toContainText('2 selected')
+      await expect(page).toHaveURL(/session=person-main-1$/)
+      await toolbar.getByRole('button', { name: 'Delete', exact: true }).click()
+      const confirmation = page.locator('.n-popconfirm')
+      await expect(confirmation).toContainText('Delete 2 selected sessions?')
+      await confirmation.getByRole('button', { name: 'Cancel', exact: true }).click()
+      expect(batchRequests()).toHaveLength(0)
+      await toolbar.getByRole('button', { name: 'Select all', exact: true }).click()
+      await expect(toolbar).toContainText('3 selected')
+      await rows.filter({ hasText: 'Person' }).click()
+      await expect(toolbar).toContainText('2 selected')
+      await page.screenshot({ path: `/tmp/person-session-batch-${width}.png`, animations: 'disabled' })
+      await toolbar.getByRole('button', { name: 'Delete', exact: true }).click()
+      await confirmation.getByRole('button', { name: 'Confirm', exact: true }).click()
+      await expect(page.getByText('Batch delete failed', { exact: true })).toBeVisible()
+      await expect(toolbar).toContainText('2 selected')
+      expect(state.conversations).toHaveLength(3)
+      state.failBatchRequest = false
+      await confirmation.getByRole('button', { name: 'Confirm', exact: true }).click()
+      await expect(confirmation).toBeHidden()
+      await expect(toolbar).toContainText('1 selected')
+      await expect(rows.filter({ hasText: second.title })).toHaveCount(0)
+      await expect(rows.filter({ hasText: third.title }).getByRole('checkbox')).toBeChecked()
+      expect(state.tasks.map((task: any) => task.session_id)).toEqual(['person-main-1', third.id])
+      expect(state.schedules.map((schedule: any) => schedule.task_id)).toEqual([third.id])
+      expect(batchRequests().map(op => op.body.ids)).toEqual([[second.id, third.id], [second.id, third.id]])
+      await page.screenshot({ path: `/tmp/person-session-batch-retry-${width}.png`, animations: 'disabled' })
+      state.batchFailedIds = []
+      await toolbar.getByRole('button', { name: 'Delete', exact: true }).click()
+      await confirmation.getByRole('button', { name: 'Confirm', exact: true }).click()
+      await expect(toolbar).toHaveCount(0)
+      await expect(rows).toHaveCount(1)
+      await sidebar.getByRole('button', { name: 'Session list actions', exact: true }).click()
+      await page.locator('.n-dropdown-option:visible').filter({ hasText: /^Batch selection$/ }).click()
+      await toolbar.getByRole('button', { name: 'Select all', exact: true }).click()
+      await toolbar.getByRole('button', { name: 'Delete', exact: true }).click()
+      await confirmation.getByRole('button', { name: 'Confirm', exact: true }).click()
+      await expect(page.getByText('Create a conversation to start chatting.')).toBeAttached()
+      expect(state.conversations).toHaveLength(0)
+      expect(state.tasks).toHaveLength(0)
+      expect(state.schedules).toHaveLength(0)
+      expect(batchRequests().map(op => op.body.ids)).toEqual([[second.id, third.id], [second.id, third.id], [third.id], ['person-main-1']])
+    })
+  }
+})
+
+for (const hasTouch of [false, true]) {
+  test.describe(`Person desktop delete controls with touch=${hasTouch}`, () => {
+    test.use({ hasTouch, viewport: { width: 1440, height: 900 } })
+    test('shows delete only for mouse hover or keyboard focus and allows deleting the last current conversation', async ({ page }) => {
+      const { state } = await setup(page, hasTouch ? 'dark' : 'light', hasTouch, false)
+      const other = { ...state.session, id: 'person-main-travel', title: '旅行计划' }
+      state.conversations.push(other)
+      await page.addInitScript(id => {
+        (window as any).__PW_CHAT_SOCKET_RESUMES__[id] = { session_id: id, messages: [], isWorking: false, events: [] }
+      }, other.id)
+      await page.goto('/#/person')
+      await expect(page.locator('.person-compose .input-textarea')).toBeVisible()
+      const row = page.locator('.person-sidebar .session-item').filter({ hasText: other.title })
+      const remove = row.locator('.session-item-delete')
+      await page.mouse.move(1200, 600)
+      await expect(remove).toHaveCSS('opacity', '0')
+      await expect(remove).toHaveCSS('pointer-events', 'none')
+      await row.hover()
+      await expect(remove).toHaveCSS('opacity', '1')
+      await row.click()
+      await expect(page.locator('.person-title')).toHaveText(other.title)
+      await page.mouse.move(1200, 600)
+      await expect(remove).toHaveCSS('opacity', '0')
+      await page.screenshot({ path: `/tmp/person-session-pc-delete-hidden-${hasTouch}.png`, animations: 'disabled' })
+      await row.press('Tab')
+      await expect(remove).toBeFocused()
+      await expect(remove).toHaveCSS('opacity', '1')
+      await page.locator('.person-compose .input-textarea').click()
+      await expect(remove).toHaveCSS('opacity', '0')
+      await page.locator('.person-sidebar .session-item').filter({ hasText: 'Person' }).click({ button: 'right' })
+      await page.locator('.n-dropdown-option:visible').filter({ hasText: /^Delete$/ }).click()
+      await page.getByRole('dialog').filter({ hasText: 'Delete this session?' }).getByRole('button', { name: 'Confirm', exact: true }).click()
+      await expect(page.locator('.person-sidebar .session-item')).toHaveCount(1)
+      await row.hover()
+      await expect(remove).toHaveCSS('opacity', '1')
+      await remove.click()
+      await page.locator('.n-popconfirm').getByRole('button', { name: 'Confirm', exact: true }).click()
+      await expect(page.getByText('Create a conversation to start chatting.')).toBeVisible()
+      await expect(page.locator('.person-sidebar .session-item')).toHaveCount(0)
+    })
+  })
+}
+
+test('Person preserves rename and delete targets on failure and retries from the desktop context menu', async ({ page }) => {
+  const { state, operations } = await setup(page, 'light', true, true)
+  const other = { ...state.session, id: 'person-main-travel', title: '旅行计划' }
+  state.conversations.push(other)
+  state.failRename = true; state.failDelete = true
+  await page.goto('/#/person')
+  await expect(page.locator('.person-compose .input-textarea')).toBeVisible()
+  const row = page.locator('.person-sidebar .session-item').filter({ hasText: other.title })
+  await row.hover()
+  await expect(row.locator('.session-item-delete')).toBeVisible()
+  await row.click({ button: 'right' })
+  await page.locator('.n-dropdown-option:visible').filter({ hasText: /^Rename$/ }).click()
+  const naming = page.getByRole('dialog').filter({ hasText: 'Rename Session' })
+  await naming.getByRole('textbox').fill('重命名后')
+  await naming.getByRole('button', { name: 'OK', exact: true }).click()
+  await expect(naming.locator('.n-alert')).toContainText('Rename failed')
+  await expect(naming.getByRole('textbox')).toHaveValue('重命名后')
+  expect(other.title).toBe('旅行计划')
+  state.failRename = false
+  await naming.getByRole('button', { name: 'OK', exact: true }).click()
+  await expect(naming).toBeHidden()
+  const renamed = page.locator('.person-sidebar .session-item').filter({ hasText: '重命名后' })
+  await renamed.click({ button: 'right' })
+  await page.locator('.n-dropdown-option:visible').filter({ hasText: /^Delete$/ }).click()
+  const confirmation = page.getByRole('dialog').filter({ hasText: 'Delete this session?' })
+  await confirmation.getByRole('button', { name: 'Confirm', exact: true }).click()
+  await expect(confirmation.locator('.n-alert')).toContainText('Conversation changed')
+  await expect(renamed).toHaveCount(1)
+  state.failDelete = false
+  await confirmation.getByRole('button', { name: 'Confirm', exact: true }).click()
+  await expect(confirmation).toBeHidden()
+  await expect(renamed).toHaveCount(0)
+  await expect(page.locator('.person-title')).toHaveText('Person')
+  expect(operations.filter(op => op.path.endsWith('/rename'))).toHaveLength(2)
+  expect(operations.filter(op => op.path.endsWith('/conversations/person-main-travel'))).toHaveLength(2)
+})
+
+test('Person search uses the shared search dialog and only requests assistant conversation content', async ({ page }) => {
+  const { state, operations } = await setup(page, 'light', false, false)
+  const other = { ...state.session, id: 'person-main-travel', title: '旅行' }
+  state.conversations.push(other)
+  state.conversationMessages[other.id] = [{ role: 'user', content: 'JAPAN-RECEIPT-73' }]
+  await page.goto('/#/person')
+  await expect(page.locator('.person-title')).toBeVisible()
+  await page.locator('.person-sidebar').getByRole('button', { name: 'Search', exact: true }).click()
+  const search = page.locator('.session-search-modal')
+  await expect(search.getByText('Search personal assistant conversations only.')).toBeVisible()
+  await search.locator('input').fill('JAPAN-RECEIPT-73')
+  await expect(search.locator('.result-item')).toHaveCount(1)
+  await search.locator('.result-item').click()
+  await expect(page.locator('.person-title')).toHaveText('旅行')
+  expect(operations.filter(operation => operation.path.endsWith('/conversations')).length).toBeGreaterThan(1)
+})
+
+for (const [mode, wallpaper] of [['light', false], ['dark', true]] as const) {
+test(`Person uses the same desktop and mobile sidebar layout as single chat in ${mode}`, async ({ page }) => {
+  const { state } = await setup(page, mode, wallpaper, false)
+  state.session.title = '旅行计划与工作安排：需要保持时间完整显示的长会话名称'
+  async function expectSingleLineSession() {
+    const row = page.locator('.person-sidebar .session-item')
+    const layout = await row.evaluate(el => {
+      const avatar = el.querySelector('.session-item-agent-logo')!.getBoundingClientRect()
+      const title = el.querySelector<HTMLElement>('.session-item-title')!
+      const name = title.getBoundingClientRect()
+      const time = el.querySelector('.session-item-time')!.getBoundingClientRect()
+      return {
+        avatarBeforeName: avatar.right < name.left,
+        nameBeforeTime: name.right < time.left,
+        avatarCenter: avatar.y + avatar.height / 2,
+        nameCenter: name.y + name.height / 2,
+        timeCenter: time.y + time.height / 2,
+        nameTruncated: title.scrollWidth > title.clientWidth,
+        fitsRow: time.right <= el.getBoundingClientRect().right && el.scrollWidth <= el.clientWidth,
+      }
+    })
+    expect(layout.avatarBeforeName).toBe(true)
+    expect(layout.nameBeforeTime).toBe(true)
+    expect(Math.abs(layout.avatarCenter - layout.nameCenter)).toBeLessThan(1)
+    expect(Math.abs(layout.avatarCenter - layout.timeCenter)).toBeLessThan(1)
+    expect(layout.nameTruncated).toBe(true)
+    expect(layout.fitsRow).toBe(true)
+    await expect(row.locator('.session-item-time')).not.toBeEmpty()
+  }
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.goto('/#/hermes/chat')
+  const chatSidebar = page.locator('.chat-panel > .session-list')
+  await expect(chatSidebar.locator('.page-sidebar-top')).toBeVisible()
+  const chatTitleX = (await page.locator('.studio-page-header .header-session-title').boundingBox())!.x
+  const desktop = await chatSidebar.evaluate(el => ({
+    width: el.getBoundingClientRect().width,
+    headerPadding: getComputedStyle(el.querySelector('.page-sidebar-top')!).padding,
+    listPadding: getComputedStyle(el.querySelector('.session-items')!).padding,
+    background: getComputedStyle(el).backgroundColor,
+  }))
+  await page.screenshot({ path: `/tmp/sidebar-single-chat-desktop-${mode}.png`, animations: 'disabled' })
+  await page.getByRole('link', { name: 'Your account assistant', exact: true }).click()
+  const sidebar = page.locator('.person-sidebar')
+  await expect(sidebar.locator('.session-item')).toBeVisible()
+  await expect(page.locator('.person-compose .input-textarea')).toBeVisible()
+  const person = await sidebar.evaluate(el => ({
+    width: el.getBoundingClientRect().width,
+    headerPadding: getComputedStyle(el.querySelector('.page-sidebar-top')!).padding,
+    listPadding: getComputedStyle(el.querySelector('.session-items')!).padding,
+    background: getComputedStyle(el).backgroundColor,
+  }))
+  await expectSingleLineSession()
+  await page.screenshot({ path: `/tmp/sidebar-person-desktop-${mode}.png`, animations: 'disabled' })
+  expect(person).toEqual(desktop)
+  expect((await page.locator('.studio-page-header .person-title').boundingBox())!.x).toBe(chatTitleX)
+  const toggle = page.getByRole('button', { name: 'Collapse menu', exact: true })
+  await toggle.click()
+  await expect.poll(async () => (await sidebar.boundingBox())?.width).toBe(0)
+  await expect(page.locator('.studio-page-header .header-sidebar-control')).toHaveAttribute('class', /--collapsed/)
+  await page.getByRole('button', { name: 'Expand menu', exact: true }).click()
+  await expect.poll(async () => (await sidebar.boundingBox())?.width).toBe(desktop.width)
+  await page.getByRole('separator', { name: 'Resize sidebar' }).focus()
+  await page.keyboard.press('Shift+ArrowRight')
+  await expect(sidebar).toHaveCSS('width', `${desktop.width + 40}px`)
+  await expect(page.locator('.header-sidebar-control')).toHaveCSS('width', `${desktop.width + 40}px`)
+  await page.reload()
+  await expect(sidebar).toHaveCSS('width', `${desktop.width + 40}px`)
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  const drawer = page.locator('.studio-mobile-drawer')
+  await expect(drawer.locator('.person-sidebar .session-item')).toBeVisible()
+  await expect(drawer.getByRole('button', { name: 'Close', exact: true })).toHaveCount(1)
+  await expect(drawer).toHaveCSS('width', '351px')
+  await expect.poll(async () => (await sidebar.boundingBox())?.x).toBe(65)
+  await expect(page.locator('.page-sidebar-account-btn')).toHaveCount(1)
+  await expectSingleLineSession()
+  await page.screenshot({ path: `/tmp/sidebar-person-mobile-${mode}.png`, animations: 'disabled' })
+  await sidebar.getByRole('button', { name: 'Search', exact: true }).click()
+  await expect(page.locator('.session-search-modal')).toBeVisible()
+  await expect(drawer).not.toBeVisible()
+  await page.keyboard.press('Escape')
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await drawer.getByRole('link', { name: 'Chat', exact: true }).click()
+  await expect(drawer.locator('.session-list .session-items')).toBeVisible()
+  await expect(drawer.getByRole('button', { name: 'Close', exact: true })).toHaveCount(1)
+  await page.screenshot({ path: `/tmp/sidebar-single-chat-mobile-${mode}.png`, animations: 'disabled' })
+  await drawer.getByRole('link', { name: 'Your account assistant', exact: true }).click()
+  await expect(drawer.locator('.person-sidebar .session-item')).toBeVisible()
+  await expect(drawer).toBeVisible()
+  await sidebar.getByRole('button', { name: 'New conversation', exact: true }).click()
+  await expect(drawer).not.toBeVisible()
+  const naming = page.getByRole('dialog').filter({ has: page.getByRole('textbox', { name: 'Conversation name' }) })
+  await expect(naming).toBeVisible()
+  await naming.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await drawer.locator('.person-sidebar .session-item').click()
+  await expect(drawer).not.toBeVisible()
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await expect(sidebar).toHaveCSS('width', `${desktop.width + 40}px`)
+  await expect(page.locator('.page-sidebar-account-btn')).toHaveCount(1)
+})
+}
+
+for (const mode of ['light', 'dark'] as const) {
+  test(`Person sidebar follows regional appearance and reset in ${mode}`, async ({ page }) => {
+    await setup(page, mode, true, false)
+    const sidebar = page.locator('.person-sidebar')
+    async function open() { await page.goto('/#/person'); await expect(page.locator('.person-compose .input-textarea')).toBeVisible() }
+    await open()
+    const original = await sidebar.evaluate(el => getComputedStyle(el).backgroundColor)
+    await page.goto('/#/hermes/theme')
+    await page.getByTestId('theme-global-backgroundColor').fill('#223344')
+    await page.getByTestId('theme-global-opacity').fill('0.4')
+    await page.getByTestId('theme-global-opacity').dispatchEvent('change')
+    await open()
+    await expect(sidebar).toHaveCSS('background-color', 'rgba(34, 51, 68, 0.4)')
+    await page.goto('/#/hermes/theme')
+    await page.getByTestId('theme-scope').selectOption('sidebar')
+    await page.getByTestId('theme-sidebar-backgroundColor').fill('#336699')
+    await page.getByTestId('theme-sidebar-opacity').fill('0')
+    await page.getByTestId('theme-sidebar-opacity').dispatchEvent('change')
+    await page.getByTestId('theme-sidebar-blur').fill('4')
+    await page.getByTestId('theme-sidebar-blur').dispatchEvent('change')
+    await open()
+    await expect(sidebar).toHaveCSS('background-color', 'rgba(51, 102, 153, 0)')
+    await expect(sidebar).toHaveCSS('opacity', '1')
+    await expect(sidebar).toHaveCSS('backdrop-filter', /blur\(4px\)/)
+    await page.screenshot({ path: `/tmp/sidebar-person-theme-${mode}.png`, animations: 'disabled' })
+    await page.goto('/#/hermes/theme')
+    await page.getByRole('button', { name: 'Restore defaults', exact: true }).click()
+    await open()
+    await expect(sidebar).toHaveCSS('background-color', original)
+    await page.goto('/#/hermes/theme')
+    await page.getByRole('button', { name: 'Remove', exact: true }).click()
+    await page.goto('/#/hermes/chat')
+    await expect(page.locator('.chat-panel > .session-list')).toBeVisible()
+    const preset = await page.locator('.chat-panel > .session-list').evaluate(el => getComputedStyle(el).backgroundColor)
+    await open()
+    await expect(sidebar).toHaveCSS('background-color', preset)
+  })
+}
+
+test('Person shows an empty state after deleting its last conversation and creates through the naming dialog on mobile', async ({ page }) => {
+  const { state } = await setup(page, 'dark', false, false)
+  state.conversations = []; state.tasks = []
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto('/#/person')
+  await expect(page.getByText('Create a conversation to start chatting.')).toBeVisible()
+  await page.locator('.person-empty').getByRole('button', { name: 'New conversation' }).click()
+  await page.getByRole('textbox', { name: 'Conversation name' }).fill('移动会话')
+  await page.getByRole('button', { name: 'Create', exact: true }).click()
+  await expect(page.locator('.person-title')).toHaveText('移动会话')
+  await expect(page.locator('.input-textarea')).toBeVisible()
+  await page.screenshot({ path: '/tmp/person-multi-session-mobile.png', animations: 'disabled' })
 })
