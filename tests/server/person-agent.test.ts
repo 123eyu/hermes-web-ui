@@ -1525,6 +1525,8 @@ describe('Person multi-conversation ownership', () => {
     const b = await createPersonConversation(1, '旅行')
     expect(a.id).not.toBe(b.id)
     expect(a.id).toMatch(/^person-main-[a-f0-9-]{36}$/)
+    expect(a.bot_type).toBe('zhezhe')
+    expect((await personSnapshot(1, a.id)).session?.bot_type).toBe('zhezhe')
     addMessage({ session_id: b.id, role: 'user', content: '独有线索 NEEDLE-MULTI' })
     addMessage({ session_id: 'person-main-2', role: 'user', content: 'NEEDLE-MULTI private' })
     createSession({ id: 'ordinary-search', user_id: 1, studio_user_id: 1, title: 'NEEDLE-MULTI', source: 'api_server', profile: 'default' })
@@ -1532,6 +1534,79 @@ describe('Person multi-conversation ownership', () => {
     expect((await personSnapshot(1, a.id)).settings.agents).toEqual((await personSnapshot(1, b.id)).settings.agents)
     expect(personConversations(2, 'NEEDLE-MULTI').sessions.map(session => session.id)).toEqual(['person-main-2'])
     await expect(createPersonConversation(1, '  ')).rejects.toThrow('conversation name')
+  })
+
+  it('rejects duplicate BOT names across all owned pages and concurrent creates', async () => {
+    const { createPersonConversation } = await import('../../packages/server/src/modules/studio/services/person/conversations')
+    const { createSession } = await import('../../packages/server/src/modules/studio/repositories/session-store')
+    for (let i = 0; i < 55; i++) createSession({ id: `person-main-page-${i}`, studio_user_id: 1, title: `Bot ${i}` })
+    const count = db.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n
+    await expect(createPersonConversation(1, '  ＢＯＴ ０  ')).rejects.toMatchObject({ status: 409, code: 'PERSON_BOT_NAME_EXISTS' })
+    expect(db.prepare('SELECT COUNT(*) AS n FROM sessions').get()!.n).toBe(count)
+    await expect(createPersonConversation(2, 'Bot 0')).resolves.toMatchObject({ title: 'Bot 0' })
+    createSession({ id: 'ordinary-same-name', studio_user_id: 1, title: 'Helper' })
+    const results = await Promise.allSettled([createPersonConversation(1, 'Helper'), createPersonConversation(1, 'helper')])
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    expect(results.find(result => result.status === 'rejected')).toMatchObject({ reason: { status: 409, code: 'PERSON_BOT_NAME_EXISTS' } })
+    const { conversationCreate } = await import('../../packages/server/src/modules/studio/controllers/person')
+    const ctx: any = { set: vi.fn(), state: { user: { id: 1 } }, request: { body: { title: 'Helper' } } }
+    await conversationCreate(ctx)
+    expect(ctx).toMatchObject({ status: 409, body: { code: 'PERSON_BOT_NAME_EXISTS' } })
+  })
+
+  it('commits a selected shared workspace with creation and rejects stale or busy changes', async () => {
+    const { createPersonConversation } = await import('../../packages/server/src/modules/studio/services/person/conversations')
+    const { getSession } = await import('../../packages/server/src/modules/studio/repositories/session-store')
+    const old = store.personSettings(1)
+    const workspace = join(dir, 'chosen')
+    const created = await createPersonConversation(1, 'Workspace bot', { workspace, expected_revision: old.revision })
+    expect(created.workspace).toBe(workspace)
+    expect(store.personSettings(1)).toMatchObject({ settings: { workspace }, revision: old.revision + 1 })
+    expect(getSession('person-main-1')?.workspace).toBe(workspace)
+    expect(existsSync(workspace)).toBe(true)
+    const before = db.prepare('SELECT id,workspace FROM sessions ORDER BY id').all()
+    await expect(createPersonConversation(1, 'Stale', { workspace: dir, expected_revision: old.revision })).rejects.toThrow('Settings changed')
+    await expect(createPersonConversation(1, 'Relative', { workspace: 'relative' })).rejects.toThrow('absolute')
+    mainBusy = true
+    await expect(createPersonConversation(1, 'Busy', { workspace: dir, expected_revision: old.revision + 1 })).rejects.toThrow('Wait for Person')
+    mainBusy = false
+    await expect(createPersonConversation(1, 'workspace bot', { workspace: dir, expected_revision: old.revision + 1 })).rejects.toMatchObject({ code: 'PERSON_BOT_NAME_EXISTS' })
+    expect(db.prepare('SELECT id,workspace FROM sessions ORDER BY id').all()).toEqual(before)
+    expect(store.personSettings(1).settings.workspace).toBe(workspace)
+    const task = await create()
+    await expect(createPersonConversation(1, 'Pending task', { workspace: dir, expected_revision: old.revision + 1 })).rejects.toThrow('Wait for Person')
+    expect(store.getPersonTask(1, task.task.id).workspace).toBe(workspace)
+  })
+
+  it('stores bot type separately from the name and isolates initial model settings', async () => {
+    const { createPersonConversation, personConversations } = await import('../../packages/server/src/modules/studio/services/person/conversations')
+    const { personSnapshot } = await import('../../packages/server/src/modules/studio/services/person/service')
+    catalog[0].models.push('m2')
+    const before = store.personSettings(1, 'person-main-1')
+    const created = await createPersonConversation(1, '我的旅行搭子', { bot_type: 'zhezhe', model: { profile: 'default', provider: 'test', model: 'm2' }, reasoning_effort: 'high' })
+    expect(created).toMatchObject({ title: '我的旅行搭子', bot_type: 'zhezhe', model: 'm2', reasoning_effort: 'high' })
+    expect(personConversations(1).sessions.find(session => session.id === created.id)?.bot_type).toBe('zhezhe')
+    expect((await personSnapshot(1, created.id)).settings.model?.model).toBe('m2')
+    expect(store.personSettings(1, 'person-main-1')).toEqual(before)
+    const count = personConversations(1).sessions.length
+    for (const input of [{ bot_type: 'unknown' }, { model: { profile: 'default', provider: 'test', model: 'missing' } }, { reasoning_effort: 'invalid' }]) {
+      await expect(createPersonConversation(1, 'Invalid', input)).rejects.toThrow()
+    }
+    expect(personConversations(1).sessions).toHaveLength(count)
+  })
+
+  it('backfills legacy bot types without overwriting explicit types or conversation history', async () => {
+    const { initAllHermesTables } = await import('../../packages/server/src/modules/studio/infrastructure/database/schemas')
+    const { createSession, getSession, addMessage } = await import('../../packages/server/src/modules/studio/repositories/session-store')
+    createSession({ id: 'person-main-future', studio_user_id: 1, bot_type: 'future-bot', title: 'Future' })
+    createSession({ id: 'ordinary-chat', studio_user_id: 1, title: 'Ordinary' })
+    addMessage({ session_id: 'person-main-1', role: 'user', content: 'Keep this history' })
+    const before = getSession('person-main-1')!
+    initAllHermesTables(); initAllHermesTables()
+    expect(getSession('person-main-1')).toEqual({ ...before, bot_type: 'zhezhe' })
+    expect(getSession('person-main-future')?.bot_type).toBe('future-bot')
+    expect(getSession('ordinary-chat')?.bot_type).toBe('')
+    expect(db.prepare('SELECT content FROM messages WHERE session_id=?').get('person-main-1')?.content).toBe('Keep this history')
   })
 
   it('keeps existing B workers and scheduled results in B when followed up from A', async () => {

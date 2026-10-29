@@ -24,7 +24,8 @@ async function handle(ctx: Context, work: (id: number, body: Record<string, unkn
     ctx.body = await work(ctx.state.user.id, body)
   } catch (error) {
     const status = Number((error as { status?: number }).status) || 500
-    ctx.status = status; ctx.body = { error: status < 500 && error instanceof Error ? error.message : 'Person operation failed' }
+    ctx.status = status; ctx.body = { error: status < 500 && error instanceof Error ? error.message : 'Person operation failed',
+      ...((error as { code?: string }).code === 'PERSON_BOT_NAME_EXISTS' ? { code: 'PERSON_BOT_NAME_EXISTS' } : {}) }
   }
 }
 export const snapshot = (ctx: Context) => handle(ctx, id => personSnapshot(id, String(ctx.query.session_id || '')))
@@ -49,5 +50,5 @@ export const memory = (ctx: Context) => handle(ctx, (id, body) => {
 })
 
 export const conversations = (ctx: Context) => handle(ctx, id => personConversations(id, String(ctx.query.search || ''), Math.max(0, Number(ctx.query.offset) || 0)))
-export const conversationCreate = (ctx: Context) => handle(ctx, (id, body) => createPersonConversation(id, body.title))
+export const conversationCreate = (ctx: Context) => handle(ctx, (id, body) => createPersonConversation(id, body.title, body))
 export const conversationDelete = (ctx: Context) => handle(ctx, (id, body) => deletePersonConversation(id, ctx.params.id, body.expected_history_revision))

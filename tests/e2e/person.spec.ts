@@ -1,6 +1,7 @@
 import { expect, test, type Locator, type Page } from '@playwright/test'
 import { authenticate, mockChatSocket, mockHermesApi } from './fixtures'
 import sharp from 'sharp'
+import { personBotNameKey } from '../../packages/shared/person-bots'
 
 async function setup(page: Page, mode: 'light' | 'dark', wallpaper = true, customAppearance = true) {
   await authenticate(page)
@@ -23,12 +24,14 @@ async function setup(page: Page, mode: 'light' | 'dark', wallpaper = true, custo
     state.tasks = state.tasks.filter((task: any) => !removedIds.has(task.id))
     state.schedules = state.schedules.filter((schedule: any) => !removedIds.has(schedule.task_id))
   }
-  await page.route('**/api/studio/sessions/batch-delete', route => {
+  await page.route('**/api/studio/sessions/batch-delete', async route => {
     const req = route.request(); const body = req.postDataJSON()
     operations.push({ path: new URL(req.url()).pathname, body, headers: req.headers() })
     if (state.failBatchRequest) return route.fulfill({ status: 500, json: { error: 'Batch unavailable' } })
     const errors = body.ids.filter((id: string) => state.batchFailedIds?.includes(id)).map((id: string) => ({ id, error: 'Task stop failed' }))
     for (const id of body.ids) if (!errors.some((error: any) => error.id === id)) removeConversation(id)
+    await emit(page, 'person.updated', {})
+    await state.afterDelete?.()
     return route.fulfill({ json: { deleted: body.ids.length - errors.length, failed: errors.length, errors } })
   })
   await page.route('**/api/studio/sessions/*/rename', route => {
@@ -45,7 +48,14 @@ async function setup(page: Page, mode: 'light' | 'dark', wallpaper = true, custo
     operations.push({ path, body, headers: req.headers() })
     if (path.endsWith('/conversations')) {
       if (req.method() === 'POST') {
-        const session = { ...state.session, id: `person-main-new-${operations.length}`, title: body.title, history_revision: 0 }
+        if (state.failCreate) return route.fulfill({ status: 503, json: { error: 'Creation unavailable' } })
+        if (state.conflictingBotName === body.title || state.conversations.some((session: any) => personBotNameKey(session.title) === personBotNameKey(body.title)))
+          return route.fulfill({ status: 409, json: { error: 'A BOT with this name already exists', code: 'PERSON_BOT_NAME_EXISTS' } })
+        if (body.workspace !== undefined) {
+          state.settings.workspace = body.workspace
+          for (const session of state.conversations) session.workspace = body.workspace || '/tmp/person/default'
+        }
+        const session = { ...state.session, id: `person-main-new-${operations.length}`, title: body.title, bot_type: body.bot_type || 'zhezhe', workspace: state.settings.workspace || '/tmp/person/default', ...(body.model ? { model: body.model.model, provider: body.model.provider } : {}), history_revision: 0 }
         state.conversations.unshift(session)
         await page.evaluate(sessionId => {
           (window as any).__PW_CHAT_SOCKET_RESUMES__[sessionId] = { session_id: sessionId, messages: [], isWorking: false, events: [] }
@@ -60,6 +70,8 @@ async function setup(page: Page, mode: 'light' | 'dark', wallpaper = true, custo
       if (state.failDelete) return route.fulfill({ status: 409, json: { error: 'Conversation changed; reload and retry' } })
       const id = decodeURIComponent(path.split('/').at(-1)!)
       removeConversation(id)
+      await emit(page, 'person.updated', {})
+      await state.afterDelete?.()
       return route.fulfill({ json: { deleted: true, session_id: id } })
     }
     if (path.endsWith('/capabilities')) return route.fulfill({ json: { agents: [{ runtime: 'ekko', installed: true }, { runtime: 'codex', installed: true }], native_allowed: true } })
@@ -1658,15 +1670,22 @@ for (const mode of ['light', 'dark'] as const) {
     state.tasks[0].running = false; state.tasks[0].execution_state = 'finished'
     await page.goto('/#/person')
     await expect(page.locator('.person-title')).toHaveText('Person')
-    await page.getByRole('button', { name: 'New conversation', exact: true }).click()
-    const dialog = page.getByRole('dialog').filter({ has: page.getByRole('textbox', { name: 'Conversation name' }) })
-    await dialog.getByRole('textbox', { name: 'Conversation name' }).fill('旅行计划')
-    await dialog.getByRole('button', { name: 'Create', exact: true }).click()
+    await page.getByRole('button', { name: 'New BOT role', exact: true }).click()
+    const draft = page.locator('.new-chat-page')
+    await expect(draft.getByRole('button', { name: 'zhezhe', exact: true })).toHaveAttribute('aria-pressed', 'true')
+    await expect(draft.getByRole('heading', { name: 'New BOT role', exact: true })).toBeVisible()
+    await expect(draft.getByRole('button', { name: 'Create', exact: true })).toHaveCount(0)
+    await expect(page.getByRole('dialog')).toHaveCount(0)
+    await page.screenshot({ path: `/tmp/person-new-chat-${mode}-desktop.png`, animations: 'disabled' })
+    await draft.getByRole('textbox', { name: 'BOT name' }).fill('旅行计划')
+    await draft.locator('.input-textarea').fill('Hello BOT')
+    await draft.getByRole('button', { name: 'Send', exact: true }).click()
     await expect(page.locator('.person-title')).toHaveText('旅行计划')
     const created = state.conversations.find((session: any) => session.title === '旅行计划')
     expect(created.id).not.toBe(state.session.id)
     await expect(page).toHaveURL(new RegExp(`session=${created.id}`))
-    await expect(dialog).not.toBeVisible()
+    await expect(draft).not.toBeVisible()
+    expect(created.bot_type).toBe('zhezhe')
     await expect(page.locator('.person-compose .input-textarea')).toBeVisible()
     await page.screenshot({ path: `/tmp/person-multi-session-${mode}.png`, animations: 'disabled' })
     await page.locator('.person-sidebar .session-item').filter({ hasText: 'Person' }).click()
@@ -1680,6 +1699,81 @@ for (const mode of ['light', 'dark'] as const) {
     expect(operations.some(operation => operation.path.endsWith(`/conversations/${created.id}`))).toBe(true)
   })
 }
+
+test('Person drafts its name, model and first message without changing the current conversation, and retries a failed create', async ({ page }) => {
+  const { state, operations } = await setup(page, 'light', false, false)
+  state.tasks[0].running = false; state.tasks[0].execution_state = 'finished'
+  await page.goto('/#/person')
+  await expect(page.locator('.person-title')).toHaveText('Person')
+  await page.locator('.person-compose .input-textarea').fill('Keep the current draft')
+  await page.getByRole('button', { name: 'New BOT role', exact: true }).click()
+  const draft = page.locator('.new-chat-page')
+  await draft.locator('.input-textarea').fill('Plan my trip')
+  await expect(draft.getByRole('button', { name: 'Send', exact: true })).toBeDisabled()
+  await draft.getByRole('textbox', { name: 'BOT name' }).fill('旅行搭子')
+  await expect(draft.getByPlaceholder('Enter BOT name')).toBeVisible()
+  await draft.getByRole('textbox', { name: 'BOT name' }).press('Enter')
+  expect(operations.filter(operation => operation.path.endsWith('/conversations') && operation.body)).toHaveLength(0)
+  await draft.getByRole('button', { name: 'Workspace', exact: true }).click()
+  const workspacePicker = page.getByRole('dialog')
+  await workspacePicker.locator('.folder-path-input input').fill('/workspace/bot-draft')
+  await workspacePicker.getByRole('button', { name: 'OK', exact: true }).click()
+  await expect(workspacePicker).toBeHidden()
+  expect(state.settings.workspace).toBe('')
+  await page.screenshot({ path: '/tmp/studio-bot-send-create/draft-light-desktop.png', animations: 'disabled' })
+  await draft.locator('.input-model-button').click()
+  await page.locator('.model-cascader:visible').getByRole('menuitemradio').filter({ hasText: 'fast-model' }).click()
+  await expect(draft.locator('.input-model-button')).toHaveAttribute('aria-label', 'fast-model')
+  expect(operations.some(operation => operation.path.endsWith('/settings'))).toBe(false)
+  expect(state.session.model).toBe('global-model')
+  state.failCreate = true
+  await draft.getByRole('button', { name: 'Send', exact: true }).click()
+  await expect(page.getByText('Creation unavailable', { exact: false })).toBeVisible()
+  await expect(draft.locator('.input-textarea')).toHaveValue('Plan my trip')
+  await expect(draft.getByRole('textbox', { name: 'BOT name' })).toHaveValue('旅行搭子')
+  expect(state.conversations).toHaveLength(1)
+  state.failCreate = false
+  await draft.getByRole('button', { name: 'Send', exact: true }).click()
+  await expect(page.locator('.person-title')).toHaveText('旅行搭子')
+  const created = state.conversations.find((session: any) => session.title === '旅行搭子')
+  const request = operations.find(operation => operation.path.endsWith('/conversations') && operation.body?.title === '旅行搭子')
+  expect(request.body).toMatchObject({ bot_type: 'zhezhe', model: { profile: 'default', provider: 'provider', model: 'fast-model' }, workspace: '/workspace/bot-draft', expected_revision: 0 })
+  expect(created.workspace).toBe('/workspace/bot-draft')
+  await expect.poll(() => emitted(page, 'run')).toEqual([expect.objectContaining({ session_id: created.id, input: 'Plan my trip' })])
+  await page.locator('.person-sidebar .session-item').filter({ hasText: 'Person' }).click()
+  await expect(page.locator('.person-compose .input-textarea')).toHaveValue('Keep the current draft')
+})
+
+test('Person keeps the first message on duplicate BOT names and creates once after correction', async ({ page }) => {
+  const { state, operations } = await setup(page, 'dark', true, true)
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto('/#/person')
+  await page.getByRole('button', { name: 'Menu', exact: true }).click()
+  await page.getByRole('button', { name: 'New BOT role', exact: true }).click()
+  const draft = page.locator('.new-chat-page')
+  const name = draft.getByRole('textbox', { name: 'BOT name' })
+  const send = draft.getByRole('button', { name: 'Send', exact: true })
+  await draft.locator('.input-textarea').fill('Keep this first message')
+  await name.fill(' ＰＥＲＳＯＮ ')
+  await expect(name).toHaveAttribute('aria-invalid', 'true')
+  await expect(draft.getByRole('alert')).toContainText('already exists')
+  await expect(send).toBeDisabled()
+  expect(operations.filter(operation => operation.path.endsWith('/conversations') && operation.body)).toHaveLength(0)
+  state.conflictingBotName = 'Unlisted BOT'
+  await name.fill('Unlisted BOT')
+  await send.click()
+  await expect(draft.getByRole('alert')).toContainText('already exists')
+  await expect(draft.locator('.input-textarea')).toHaveValue('Keep this first message')
+  await expect(send).toBeDisabled()
+  await page.screenshot({ path: '/tmp/studio-bot-send-create/duplicate-dark-mobile.png', animations: 'disabled' })
+  await name.fill('New helper')
+  await expect(draft.getByRole('alert')).toHaveCount(0)
+  await send.evaluate(button => { button.dispatchEvent(new MouseEvent('click', { bubbles: true })); button.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+  await expect(page.locator('.person-title')).toHaveText('New helper')
+  expect(state.conversations.filter((session: any) => session.title === 'New helper')).toHaveLength(1)
+  expect(operations.filter(operation => operation.path.endsWith('/conversations') && operation.body?.title === 'New helper')).toHaveLength(1)
+  await expect.poll(() => emitted(page, 'run')).toEqual([expect.objectContaining({ input: 'Keep this first message' })])
+})
 
 async function longPressConversation(page: Page, row: Locator) {
   await row.tap({ trial: true })
@@ -1775,16 +1869,124 @@ test.describe('Person mobile conversation actions', () => {
       await longPressConversation(page, sidebar.locator('.session-item'))
       await menu.filter({ hasText: /^Delete$/ }).click()
       await confirmation.getByRole('button', { name: 'Confirm', exact: true }).click()
-      await expect(page.getByText('Create a conversation to start chatting.')).toBeVisible()
+      await expect(page.locator('.new-chat-page')).toBeVisible()
       expect(state.conversations).toHaveLength(0)
       expect(state.tasks).toHaveLength(0)
-      await page.locator('.person-empty').getByRole('button', { name: 'New conversation' }).click()
-      await page.getByRole('textbox', { name: 'Conversation name' }).fill('新会话')
-      await page.getByRole('button', { name: 'Create', exact: true }).click()
+      await page.getByRole('textbox', { name: 'BOT name' }).fill('新会话')
+      await page.locator('.new-chat-page .input-textarea').fill('Hello BOT')
+      await page.getByRole('button', { name: 'Send', exact: true }).click()
       await expect(page.locator('.person-title')).toHaveText('新会话')
       expect(operations.filter(op => op.path === '/api/studio/person/conversations' && op.body?.title)).toHaveLength(1)
     })
   }
+})
+
+for (const deletion of ['single', 'batch'] as const) {
+  test(`Person returns to BOT creation without stale-session errors after ${deletion} deletion`, async ({ page }) => {
+    const { state } = await setup(page, 'light', false, false)
+    let releaseDeletion!: () => void
+    const deleting = new Promise<void>(resolve => { releaseDeletion = resolve })
+    state.afterDelete = () => deleting
+    const staleRequests: string[] = []
+    await page.route(/\/api\/studio\/person\?session_id=/, route => {
+      if (!state.conversations.length) staleRequests.push(route.request().url())
+      return route.fallback()
+    })
+    await page.goto('/#/person')
+    await expect(page.locator('.person-compose .input-textarea')).toBeVisible()
+    const sidebar = page.locator('.person-sidebar')
+    if (deletion === 'single') {
+      await sidebar.locator('.session-item').hover()
+      await sidebar.locator('.session-item-delete').click()
+    } else {
+      await sidebar.getByRole('button', { name: 'Session list actions', exact: true }).click()
+      await page.locator('.n-dropdown-option:visible').filter({ hasText: /^Batch selection$/ }).click()
+      const toolbar = sidebar.locator('.session-list-toolbar')
+      await toolbar.getByRole('button', { name: 'Select all', exact: true }).click()
+      await toolbar.getByRole('button', { name: 'Delete', exact: true }).click()
+    }
+    await page.locator('.n-popconfirm').getByRole('button', { name: 'Confirm', exact: true }).click()
+    try {
+      // The socket notification arrives before the deletion response, as on the server.
+      await expect(sidebar.locator('.session-item')).toHaveCount(0)
+      expect(staleRequests).toEqual([])
+    } finally { releaseDeletion() }
+    await expect(page.locator('.new-chat-page')).toBeVisible()
+    await expect(page).toHaveURL(/#\/person$/)
+    await expect(page.locator('.person-alert')).toHaveCount(0)
+    await page.getByRole('textbox', { name: 'BOT name' }).fill('Replacement BOT')
+    await page.locator('.new-chat-page .input-textarea').fill('Hello again')
+    await page.getByRole('button', { name: 'Send', exact: true }).click()
+    await expect(page.locator('.person-title')).toHaveText('Replacement BOT')
+    expect(state.conversations).toHaveLength(1)
+    await expect(page.locator('.person-alert')).toHaveCount(0)
+  })
+}
+
+for (const status of [404, 503]) {
+  test(`Person ignores a delayed ${status} from a deleted BOT`, async ({ page }) => {
+    const { state } = await setup(page, 'dark', true, false)
+    await page.goto('/#/person')
+    await expect(page.locator('.person-compose .input-textarea')).toBeVisible()
+    let releaseSnapshot!: () => void
+    const snapshot = new Promise<void>(resolve => { releaseSnapshot = resolve })
+    let intercepted = false
+    await page.route(/\/api\/studio\/person\?session_id=person-main-1$/, async route => {
+      if (intercepted) return route.fallback()
+      intercepted = true
+      await snapshot
+      return route.fulfill({ status, json: { error: status === 404 ? 'Session not found' : 'Temporarily unavailable' } })
+    })
+    await emit(page, 'person.updated', {})
+    await expect.poll(() => intercepted).toBe(true)
+    try {
+      const row = page.locator('.person-sidebar .session-item')
+      await row.hover()
+      await row.locator('.session-item-delete').click()
+      await page.locator('.n-popconfirm').getByRole('button', { name: 'Confirm', exact: true }).click()
+      await expect(page).toHaveURL(/#\/person$/)
+      expect(state.conversations).toHaveLength(0)
+    } finally { releaseSnapshot() }
+    await expect(page.locator('.new-chat-page')).toBeVisible()
+    await expect(page.locator('.person-alert')).toHaveCount(0)
+  })
+}
+
+test('Person recovers a deleted BOT link without displaying an API error', async ({ page }) => {
+  const { state } = await setup(page, 'light', false, false)
+  state.conversations = []
+  await page.goto('/#/person?session=person-main-deleted')
+  await expect(page.locator('.new-chat-page')).toBeVisible()
+  await expect(page).toHaveURL(/#\/person$/)
+  await expect(page.locator('.person-alert')).toHaveCount(0)
+})
+
+test('Person keeps the newly selected BOT when an old snapshot returns 404', async ({ page }) => {
+  const { state } = await setup(page, 'light', false, false)
+  const other = { ...state.session, id: 'person-main-other', title: 'Other BOT' }
+  state.conversations.push(other)
+  await page.addInitScript(id => {
+    (window as any).__PW_CHAT_SOCKET_RESUMES__[id] = { session_id: id, messages: [], isWorking: false, events: [] }
+  }, other.id)
+  await page.goto('/#/person')
+  await expect(page.locator('.person-compose .input-textarea')).toBeVisible()
+  let releaseSnapshot!: () => void
+  const snapshot = new Promise<void>(resolve => { releaseSnapshot = resolve })
+  let intercepted = false
+  await page.route(/\/api\/studio\/person\?session_id=person-main-1$/, async route => {
+    intercepted = true
+    await snapshot
+    return route.fulfill({ status: 404, json: { error: 'Session not found' } })
+  })
+  await emit(page, 'person.updated', {})
+  await expect.poll(() => intercepted).toBe(true)
+  try {
+    await page.locator('.person-sidebar .session-item').filter({ hasText: other.title }).click()
+    await expect(page).toHaveURL(/session=person-main-other$/)
+  } finally { releaseSnapshot() }
+  await expect(page.locator('.person-title')).toHaveText(other.title)
+  await expect(page).toHaveURL(/session=person-main-other$/)
+  await expect(page.locator('.person-alert')).toHaveCount(0)
 })
 
 test.describe('Person batch conversation deletion', () => {
@@ -1860,7 +2062,7 @@ test.describe('Person batch conversation deletion', () => {
       await toolbar.getByRole('button', { name: 'Select all', exact: true }).click()
       await toolbar.getByRole('button', { name: 'Delete', exact: true }).click()
       await confirmation.getByRole('button', { name: 'Confirm', exact: true }).click()
-      await expect(page.getByText('Create a conversation to start chatting.')).toBeAttached()
+      await expect(page.locator('.new-chat-page')).toBeAttached()
       expect(state.conversations).toHaveLength(0)
       expect(state.tasks).toHaveLength(0)
       expect(state.schedules).toHaveLength(0)
@@ -1906,7 +2108,7 @@ for (const hasTouch of [false, true]) {
       await expect(remove).toHaveCSS('opacity', '1')
       await remove.click()
       await page.locator('.n-popconfirm').getByRole('button', { name: 'Confirm', exact: true }).click()
-      await expect(page.getByText('Create a conversation to start chatting.')).toBeVisible()
+      await expect(page.locator('.new-chat-page')).toBeVisible()
       await expect(page.locator('.person-sidebar .session-item')).toHaveCount(0)
     })
   })
@@ -2056,11 +2258,9 @@ test(`Person uses the same desktop and mobile sidebar layout as single chat in $
   await drawer.getByRole('link', { name: 'Your account assistant', exact: true }).click()
   await expect(drawer.locator('.person-sidebar .session-item')).toBeVisible()
   await expect(drawer).toBeVisible()
-  await sidebar.getByRole('button', { name: 'New conversation', exact: true }).click()
+  await sidebar.getByRole('button', { name: 'New BOT role', exact: true }).click()
   await expect(drawer).not.toBeVisible()
-  const naming = page.getByRole('dialog').filter({ has: page.getByRole('textbox', { name: 'Conversation name' }) })
-  await expect(naming).toBeVisible()
-  await naming.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await expect(page.locator('.new-chat-page')).toBeVisible()
   await page.getByRole('button', { name: 'Menu', exact: true }).click()
   await drawer.locator('.person-sidebar .session-item').click()
   await expect(drawer).not.toBeVisible()
@@ -2109,15 +2309,16 @@ for (const mode of ['light', 'dark'] as const) {
   })
 }
 
-test('Person shows an empty state after deleting its last conversation and creates through the naming dialog on mobile', async ({ page }) => {
+test('Person starts with the shared new conversation page and creates on mobile', async ({ page }) => {
   const { state } = await setup(page, 'dark', false, false)
   state.conversations = []; state.tasks = []
   await page.setViewportSize({ width: 390, height: 844 })
   await page.goto('/#/person')
-  await expect(page.getByText('Create a conversation to start chatting.')).toBeVisible()
-  await page.locator('.person-empty').getByRole('button', { name: 'New conversation' }).click()
-  await page.getByRole('textbox', { name: 'Conversation name' }).fill('移动会话')
-  await page.getByRole('button', { name: 'Create', exact: true }).click()
+  await expect(page.locator('.new-chat-page')).toBeVisible()
+  await page.screenshot({ path: '/tmp/person-new-chat-dark-mobile.png', animations: 'disabled' })
+  await page.getByRole('textbox', { name: 'BOT name' }).fill('移动会话')
+  await page.locator('.new-chat-page .input-textarea').fill('Hello BOT')
+  await page.getByRole('button', { name: 'Send', exact: true }).click()
   await expect(page.locator('.person-title')).toHaveText('移动会话')
   await expect(page.locator('.input-textarea')).toBeVisible()
   await page.screenshot({ path: '/tmp/person-multi-session-mobile.png', animations: 'disabled' })
