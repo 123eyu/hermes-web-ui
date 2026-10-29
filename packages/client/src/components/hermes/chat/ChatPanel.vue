@@ -3,6 +3,7 @@ import { agentMetadata, isNativeCodingAgent, isGlobalOnlyCodingAgent } from '@/u
 import SessionListSidebar from "./SessionListSidebar.vue"
 import SessionSelectionToolbar from "./SessionSelectionToolbar.vue"
 import { usePageSidebarState } from "@/composables/usePageSidebar"
+import { useSessionReadState } from '@/composables/useSessionReadState'
 import { usePageLoadingState, usePageLoadingTask } from '@/composables/usePageLoading'
 import { useCodingAgentModels } from '@/composables/useCodingAgentModels'
 import PageHeader from '@/components/layout/PageHeader.vue'
@@ -73,6 +74,7 @@ import PageSidebarNav from "@/components/layout/PageSidebarNav.vue";
 import { getStoredUserId, isStoredSuperAdmin } from "@/api/client";
 import { loadNewChatFormPreferences, saveNewChatFormPreferences } from "@/utils/new-chat-form-preferences";
 import { useDefaultWorkspace } from "@/composables/useDefaultWorkspace";
+import { useChatSurfaceReveal } from "@/composables/useChatSurfaceReveal";
 import ModelCascader from "@/components/hermes/models/ModelCascader.vue";
 import { configuredProviderApiMode, canScopedCodingAgentUseProvider, usesServerManagedProviderAuth } from "@/utils/codingAgentProviders";
 import { OPEN_SUBAGENT_STREAM_EVENT, type OpenSubagentStreamDetail } from "@/utils/hermes/subagent-stream";
@@ -107,6 +109,7 @@ const FilePreview = defineAsyncComponent(async () => (await import('@/components
 const DesktopBrowserPanel = defineAsyncComponent(async () => (await import('./DesktopBrowserPanel.vue')).default);
 
 const chatStore = useChatStore();
+const sessionStates = useSessionReadState(() => props.contentMode === 'chat' && !chatStore.isLoadingMessages ? chatStore.activeSessionId : null);
 const appStore = useAppStore();
 const profilesStore = useProfilesStore();
 const filesStore = useFilesStore();
@@ -145,7 +148,7 @@ const chatInputRef = ref<(InstanceType<typeof ChatInput> & {
 }) | null>(null);
 const chatContentWrapperRef = ref<HTMLElement | null>(null);
 const chatMainContentRef = ref<HTMLElement | null>(null);
-let sessionFadeAnimation: Animation | null = null;
+useChatSurfaceReveal(chatMainContentRef, () => chatStore.activeSessionId || 'new-chat', () => !chatStore.isLoadingMessages || chatStore.messages.length > 0);
 let workspacePreviewRequestSeq = 0;
 let workspacePreviewRequestPending = false;
 const chatDropCounter = ref(0);
@@ -541,21 +544,6 @@ watch(
     // composer keeps whatever focus the sidebar click left behind, so the first
     // keystroke goes nowhere.
     chatInputRef.value?.focusComposer?.();
-
-    const surface = chatMainContentRef.value;
-    if (!surface || typeof surface.animate !== "function") return;
-
-    sessionFadeAnimation?.cancel();
-    sessionFadeAnimation = surface.animate(
-      [
-        { opacity: 0 },
-        { opacity: 1 },
-      ],
-      {
-        duration: 1500,
-        easing: "ease",
-      },
-    );
   },
   { flush: "post" },
 );
@@ -571,13 +559,11 @@ onUnmounted(() => {
   window.removeEventListener("resize", updateNewChatCategoryAnchor);
   window.removeEventListener("scroll", updateNewChatCategoryAnchor, true);
   stopToolResize();
-  sessionFadeAnimation?.cancel();
   workspacePreviewRequestSeq += 1;
   if (workspacePreviewRequestPending || previewOnlyFileOpen.value || filesStore.previewFile?.workspaceSessionId) filesStore.closePreview();
   workspacePreviewRequestPending = false;
   previewOnlyFileOpen.value = false;
   toolPanelStore.closeWorkspaceDiff();
-  sessionFadeAnimation = null;
 });
 watch(showToolPanel, async (visible) => {
   if (!visible || isMobile.value) return;
@@ -2579,8 +2565,8 @@ watch([isEmptySingleChat, () => route.fullPath], ([empty]) => {
             :active="s.id === chatStore.activeSessionId"
             :pinned="true"
             can-delete
-            :streaming="chatStore.isSessionWorking(s.id)"
-            :completed-unread="chatStore.isSessionCompletedUnread(s.id)"
+            :streaming="sessionStates.isWorking(s.id, chatStore.isSessionWorking(s.id))"
+            :completed-unread="sessionStates.isUnread(s.id, chatStore.isSessionCompletedUnread(s.id))"
             :selectable="isBatchMode"
             :selected="isSessionSelected(s)"
             :show-profile="true"
@@ -2633,8 +2619,8 @@ watch([isEmptySingleChat, () => route.fullPath], ([empty]) => {
               :active="s.id === chatStore.activeSessionId"
               :pinned="Boolean(s.isPinned)"
               can-delete
-              :streaming="chatStore.isSessionWorking(s.id)"
-              :completed-unread="chatStore.isSessionCompletedUnread(s.id)"
+              :streaming="sessionStates.isWorking(s.id, chatStore.isSessionWorking(s.id))"
+              :completed-unread="sessionStates.isUnread(s.id, chatStore.isSessionCompletedUnread(s.id))"
               :selectable="isBatchMode"
               :selected="isSessionSelected(s)"
               :show-profile="true"
@@ -2714,8 +2700,8 @@ watch([isEmptySingleChat, () => route.fullPath], ([empty]) => {
               :active="s.id === chatStore.activeSessionId"
               :pinned="false"
               can-delete
-              :streaming="chatStore.isSessionWorking(s.id)"
-              :completed-unread="chatStore.isSessionCompletedUnread(s.id)"
+              :streaming="sessionStates.isWorking(s.id, chatStore.isSessionWorking(s.id))"
+              :completed-unread="sessionStates.isUnread(s.id, chatStore.isSessionCompletedUnread(s.id))"
               :selectable="isBatchMode"
               :selected="isSessionSelected(s)"
               :show-profile="true"
@@ -3743,17 +3729,6 @@ watch([isEmptySingleChat, () => route.fullPath], ([empty]) => {
   flex-direction: column;
   min-width: 0;
   background-color: var(--theme-content-bg, $bg-main-surface);
-  animation: chat-surface-fade-in 1.5s ease both;
-}
-
-@keyframes chat-surface-fade-in {
-  from {
-    opacity: 0;
-  }
-
-  to {
-    opacity: 1;
-  }
 }
 
 .chat-header {

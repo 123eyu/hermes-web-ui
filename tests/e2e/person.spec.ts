@@ -2,6 +2,9 @@ import { expect, test, type Locator, type Page } from '@playwright/test'
 import { authenticate, mockChatSocket, mockHermesApi } from './fixtures'
 import sharp from 'sharp'
 import { PERSON_BOTS, personBotNameKey } from '../../packages/shared/person-bots'
+import { createServer } from 'node:http'
+import { Server } from 'socket.io'
+import type { SessionListState } from '../../packages/shared/session-state'
 
 async function setup(page: Page, mode: 'light' | 'dark', wallpaper = true, customAppearance = true) {
   await authenticate(page)
@@ -183,8 +186,8 @@ for (const listState of ['existing', 'empty', 'unavailable']) {
   })
 }
 
-async function setupSessionModels(page: Page) {
-  const { state, operations } = await setup(page, 'light', false, false)
+async function setupSessionModels(page: Page, mode: 'light' | 'dark' = 'light') {
+  const { state, operations } = await setup(page, mode, mode === 'dark', mode === 'dark')
   const second = { ...state.session, id: 'person-main-second', title: 'Second' }
   state.conversations.push(second)
   await page.addInitScript(id => {
@@ -288,6 +291,172 @@ test('Person session switch closes a model picker opened for the previous sessio
   expect(operations.filter(op => op.path.endsWith('/settings'))).toEqual([])
 })
 
+test('Person keeps its dialogue and composer mounted while switching conversations', async ({ page }) => {
+  const { second } = await setupSessionModels(page)
+  await page.goto('/#/person?session=person-main-1')
+  await expect(page.locator('.person-compose .input-textarea')).toBeVisible()
+  const before = await page.locator('.person-compose .input-textarea').elementHandle()
+  const messages = await page.locator('.message-list-shell').elementHandle()
+  let release!: () => void
+  const snapshot = new Promise<void>(resolve => { release = resolve })
+  await page.route(`**/api/studio/person?session_id=${second.id}`, async route => {
+    await snapshot
+    return route.fallback()
+  })
+  try {
+    await page.locator('.person-sidebar .session-item').filter({ hasText: second.title }).click()
+    await expect(page.locator('.person-title')).toHaveText(second.title)
+    await expect(page.locator('.person-view')).toHaveAttribute('inert', '')
+    expect(await before!.evaluate(el => el.isConnected)).toBe(true)
+    expect(await messages!.evaluate(el => el.isConnected)).toBe(true)
+    await expect(page.locator('.person-view > .page-loading-overlay')).toHaveCount(0)
+  } finally { release() }
+  await expect(page.locator('.person-view')).not.toHaveAttribute('inert')
+  expect(await before!.evaluate(el => el.isConnected)).toBe(true)
+  expect(await messages!.evaluate(el => el.isConnected)).toBe(true)
+})
+
+for (const mode of ['light', 'dark'] as const) {
+  test(`Person fades the resumed BOT transcript before its settings snapshot completes in ${mode}`, async ({ page }) => {
+    const { second } = await setupSessionModels(page, mode)
+    await page.addInitScript(id => {
+      (window as any).__PW_CHAT_SOCKET_RESUMES__[id].messages = [{ id: 2, role: 'assistant', content: 'The second BOT reply', timestamp: 1 }]
+    }, second.id)
+    await page.goto('/#/person?session=person-main-1')
+    await expect(page.locator('.person-view')).toHaveAttribute('aria-busy', 'false')
+    const input = await page.locator('.person-compose .input-textarea').elementHandle()
+    let release!: () => void
+    const snapshot = new Promise<void>(resolve => { release = resolve })
+    await page.route(`**/api/studio/person?session_id=${second.id}`, async route => { await snapshot; return route.fallback() })
+    try {
+      await page.locator('.person-sidebar .session-item').filter({ hasText: second.title }).click()
+      await expect(page.getByText('The second BOT reply', { exact: true })).toBeVisible()
+      await expect(page.locator('.person-view')).toHaveAttribute('inert', '')
+      const surface = page.locator('.person-chat-surface')
+      await expect.poll(() => surface.evaluate(el => el.getAnimations().length)).toBe(1)
+      const reveal = await surface.evaluate(el => {
+        const animation = el.getAnimations()[0]
+        animation.pause(); animation.currentTime = 750
+        return { timing: animation.effect!.getTiming(), keyframes: (animation.effect as KeyframeEffect).getKeyframes(), opacity: Number(getComputedStyle(el).opacity) }
+      })
+      expect(reveal.timing).toMatchObject({ duration: 1500, easing: 'ease' })
+      expect(reveal.keyframes.map(frame => Number(frame.opacity))).toEqual([0, 1])
+      expect(reveal.opacity).toBeGreaterThan(0)
+      expect(reveal.opacity).toBeLessThan(1)
+      expect(await input!.evaluate(el => el.isConnected)).toBe(true)
+      await page.screenshot({ path: `/tmp/studio-person-switch-fade-${mode}.png` })
+      await surface.evaluate(el => el.getAnimations()[0]?.finish())
+      expect(await page.evaluate(id => (window as any).__PW_CHAT_SOCKET__.emitted.filter((entry: any) => entry.event === 'resume' && entry.payload.session_id === id).length, second.id)).toBe(1)
+    } finally { release() }
+    await expect(page.locator('.person-view')).not.toHaveAttribute('inert')
+  })
+}
+
+test('Person starts resume while its initial snapshot is still loading', async ({ page }) => {
+  await setupSessionModels(page)
+  let release!: () => void
+  const snapshot = new Promise<void>(resolve => { release = resolve })
+  await page.route('**/api/studio/person?session_id=person-main-1', async route => { await snapshot; return route.fallback() })
+  await page.goto('/#/person?session=person-main-1')
+  try {
+    await expect.poll(() => page.evaluate(() => (window as any).__PW_CHAT_SOCKET__?.emitted.some((entry: any) => entry.event === 'resume' && entry.payload.session_id === 'person-main-1') || false)).toBe(true)
+  } finally { release() }
+  await expect(page.locator('.person-compose .input-textarea')).toBeVisible()
+})
+
+test('Person shows its welcome only after history confirms an empty BOT', async ({ page }) => {
+  const { state, second, models } = await setupSessionModels(page)
+  const empty = { ...second, id: 'person-main-empty', title: 'Empty BOT' }
+  const unknown = { ...second, id: 'person-main-unknown', title: 'Unknown BOT' }
+  for (const session of [empty, unknown]) {
+    state.conversations.push(session)
+    models.set(session.id, structuredClone(models.get(second.id)!))
+  }
+  await page.addInitScript(id => { delete (window as any).__PW_CHAT_SOCKET_RESUMES__[id] }, second.id)
+  await page.goto('/#/person?session=person-main-1')
+  const welcome = page.locator('.person-chat-messages .empty-state')
+  await expect(welcome).toBeVisible()
+  const select = async (session: { id: string; title: string }) => {
+    await page.locator('.person-sidebar .session-item').filter({ hasText: session.title }).click()
+    await page.waitForFunction(id => (window as any).__PW_CHAT_SOCKET__.emitted.some((entry: any) => entry.event === 'resume' && entry.payload.session_id === id), session.id)
+    await expect(welcome).toHaveCount(0)
+  }
+  const resumed = async (id: string, messages?: any[]) => page.evaluate(({ id, messages }) => {
+    (window as any).__PW_CHAT_SOCKET__.latest.__trigger('resumed', {
+      session_id: id, isWorking: false, events: [], messageTotal: messages?.length ?? 0,
+      ...(messages ? { messages } : {}),
+    })
+  }, { id, messages })
+  await select(second)
+  await resumed(second.id, [{ id: 1, role: 'assistant', content: 'Existing BOT history', timestamp: 1 }])
+  await expect(page.getByText('Existing BOT history', { exact: true })).toBeVisible()
+  await expect(welcome).toHaveCount(0)
+  await select(empty)
+  await resumed(empty.id, [])
+  await expect(welcome).toBeVisible()
+  await select(unknown)
+  await resumed(unknown.id)
+  await expect(page.locator('.person-chat-messages')).toBeVisible()
+  await expect(welcome).toHaveCount(0)
+})
+
+test('Person fades cached BOT messages immediately without restarting on the fresh resume', async ({ page }) => {
+  const { second } = await setupSessionModels(page)
+  await page.addInitScript(id => {
+    (window as any).__PW_CHAT_SOCKET_RESUMES__[id].messages = [{ id: 2, role: 'assistant', content: 'Cached BOT reply', timestamp: 1 }]
+  }, second.id)
+  await page.goto('/#/person?session=person-main-1')
+  await expect(page.locator('.person-view')).toHaveAttribute('aria-busy', 'false')
+  const row = (title: string) => page.locator('.person-sidebar .session-item').filter({ hasText: title })
+  await row(second.title).click()
+  await expect(page.getByText('Cached BOT reply', { exact: true })).toBeVisible()
+  await row('Person').click()
+  await expect(page.locator('.person-title')).toHaveText('Person')
+  await page.evaluate(id => { delete (window as any).__PW_CHAT_SOCKET_RESUMES__[id] }, second.id)
+  await row(second.title).click()
+  await expect(page.getByText('Cached BOT reply', { exact: true })).toBeVisible()
+  const surface = page.locator('.person-chat-surface')
+  await expect.poll(() => surface.evaluate(el => el.getAnimations().length)).toBe(1)
+  await surface.evaluate(el => {
+    const animation = el.getAnimations()[0]
+    animation.pause(); animation.currentTime = 750
+    ;(window as any).__cachedBotReveal = animation
+  })
+  await page.evaluate(id => (window as any).__PW_CHAT_SOCKET__.latest.__trigger('resumed', {
+    session_id: id, isWorking: false, events: [], messages: [{ id: 2, role: 'assistant', content: 'Fresh BOT reply', timestamp: 1 }],
+  }), second.id)
+  await expect(page.getByText('Fresh BOT reply', { exact: true })).toBeVisible()
+  expect(await surface.evaluate(el => el.getAnimations()[0] === (window as any).__cachedBotReveal)).toBe(true)
+  await surface.evaluate(el => el.getAnimations()[0]?.finish())
+})
+
+test('Person reveals only the latest BOT during rapid switches and respects reduced motion', async ({ page }) => {
+  const { state, second, models } = await setupSessionModels(page)
+  const third = { ...second, id: 'person-main-third', title: 'Third' }
+  state.conversations.push(third)
+  models.set(third.id, structuredClone(models.get(second.id)!))
+  await page.addInitScript(id => {
+    (window as any).__PW_CHAT_SOCKET_RESUMES__[id] = { session_id: id, messages: [{ id: 3, role: 'assistant', content: 'The latest BOT reply', timestamp: 1 }], isWorking: false, events: [] }
+  }, third.id)
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  await page.goto('/#/person?session=person-main-1')
+  await expect(page.locator('.person-view')).toHaveAttribute('aria-busy', 'false')
+  let release!: () => void
+  const snapshot = new Promise<void>(resolve => { release = resolve })
+  await page.route(`**/api/studio/person?session_id=${second.id}`, async route => { await snapshot; return route.fallback() })
+  try {
+    await page.locator('.person-sidebar .session-item').filter({ hasText: second.title }).click()
+    await expect(page.locator('.person-view')).toHaveAttribute('inert', '')
+    await page.locator('.person-sidebar .session-item').filter({ hasText: third.title }).click()
+    await expect(page.locator('.person-title')).toHaveText(third.title)
+    await expect(page.locator('.person-view')).not.toHaveAttribute('inert')
+    await expect(page.getByText('The latest BOT reply', { exact: true })).toBeVisible()
+    expect(await page.locator('.person-chat-surface').evaluate(el => el.getAnimations().length)).toBe(0)
+  } finally { release() }
+  await expect(page.locator('.person-title')).toHaveText(third.title)
+  await expect(page.locator('.person-alert')).toHaveCount(0)
+})
+
 test('Person events use the existing global question notification and open the main window',async({page})=>{
   await setup(page,'light',false,false)
   await page.goto('/#/person')
@@ -296,7 +465,7 @@ test('Person events use the existing global question notification and open the m
   await expect(page).toHaveURL(/#\/hermes\/chat$/)
   await expect.poll(()=>page.evaluate(()=>(window as any).__PW_CHAT_SOCKET__?.allSockets?.some((socket:any)=>String(socket.url).endsWith('/chat-run')))).toBe(true)
   await page.evaluate(()=>{
-    const socket=(window as any).__PW_CHAT_SOCKET__.allSockets.find((socket:any)=>String(socket.url).endsWith('/chat-run'))
+    const socket=(window as any).__PW_CHAT_SOCKET__.allSockets.find((socket:any)=>String(socket.url).endsWith('/chat-run') && !socket.options?.query?.session_state)
     socket.__trigger('person.clarification.requested',{event:'person.clarification.requested',session_id:'person-main-1',clarify_id:'main-question',question:'Choose the report scope',choices:['Today','This week'],durable:true})
   })
   const title=page.getByRole('button',{name:'zhezhe · The agent has a question for you'})
@@ -307,13 +476,166 @@ test('Person events use the existing global question notification and open the m
   await expect(page.locator('.person-title')).toHaveText('Person')
 })
 
-async function backgroundTaskCount(page: Page, count: number, state = 'searching') {
-  await expect.poll(() => page.evaluate(() => (window as any).__PW_CHAT_SOCKET__?.allSockets?.some((socket: any) => String(socket.url).endsWith('/person-presence')))).toBe(true)
-  await page.evaluate(({ count, state }) => {
-    const socket = (window as any).__PW_CHAT_SOCKET__.allSockets.find((socket: any) => String(socket.url).endsWith('/person-presence'))
-    socket.__trigger('person.presence', { state, backgroundTaskCount: count, lastActivityAt: 1, sleepAt: 600001 })
-  }, { count, state })
+async function backgroundTaskCount(page: Page, count: number, _state = 'searching', sessionId = 'person-main-1') {
+  await expect.poll(() => page.evaluate(() => (window as any).__PW_CHAT_SOCKET__?.allSockets?.some((socket: any) => socket.options?.query?.session_state === '1'))).toBe(true)
+  await page.evaluate(({ count, sessionId }) => {
+    const socket = (window as any).__PW_CHAT_SOCKET__.allSockets.find((socket: any) => socket.options?.query?.session_state === '1')
+    socket.__trigger('sessions.state.updated', { sessionId, working: count > 0, backgroundPending: count,
+      lastMessageId: 0, readMessageId: 0, unread: false })
+  }, { count, sessionId })
 }
+
+test('Person scopes task indicators to the conversation and receives remote unread receipts', async ({ page }) => {
+  const { second } = await setupSessionModels(page)
+  await page.goto('/#/person?session=person-main-1')
+  await expect(page.locator('.person-title')).toHaveText('Person')
+  const island = page.locator('.person-task-island')
+  await backgroundTaskCount(page, 2, 'searching', second.id)
+  await expect(island).toHaveCount(0)
+  const row = page.locator('.person-sidebar .session-item').filter({ hasText: 'Second' })
+  await expect(row.locator('.session-item-agent-logo-wrap.streaming')).toBeVisible()
+  await page.evaluate(sessionId => {
+    const socket = (window as any).__PW_CHAT_SOCKET__.allSockets.find((socket: any) => socket.options?.query?.session_state === '1')
+    socket.__trigger('sessions.state.updated', { sessionId, working: true, backgroundPending: 2,
+      lastMessageId: 10, readMessageId: 0, unread: true })
+  }, second.id)
+  await expect(row.locator('.session-item-unread-dot')).toHaveCount(0)
+  await backgroundTaskCount(page, 1)
+  await expect(island).toBeVisible()
+  await switchPersonSession(page, second.id)
+  await expect(island.locator('.person-task-island__count')).toHaveText('2')
+  expect(await emitted(page, 'sessions.read')).not.toContainEqual({ sessionId: second.id, messageId: 10 })
+  await page.evaluate(sessionId => {
+    const socket = (window as any).__PW_CHAT_SOCKET__.allSockets.find((socket: any) => socket.options?.query?.session_state === '1')
+    socket.__trigger('sessions.state.updated', { sessionId, working: false, backgroundPending: 0,
+      lastMessageId: 10, readMessageId: 0, unread: true })
+  }, second.id)
+  await expect.poll(() => emitted(page, 'sessions.read')).toContainEqual({ sessionId: second.id, messageId: 10 })
+  await page.evaluate(sessionId => {
+    const socket = (window as any).__PW_CHAT_SOCKET__.allSockets.find((socket: any) => socket.options?.query?.session_state === '1')
+    socket.__trigger('sessions.state.updated', { sessionId, working: false, backgroundPending: 0,
+      lastMessageId: 10, readMessageId: 10, unread: false })
+  }, second.id)
+  await expect(island).toHaveCount(0)
+  await expect(row.locator('.session-item-unread-dot')).toHaveCount(0)
+  await expect(page.locator('.person-sidebar .session-item').filter({ hasText: 'Person' }).locator('.session-item-agent-logo-wrap.streaming')).toBeVisible()
+})
+
+test('Person shows collaboration activity first and unread only after execution ends', async ({ page }) => {
+  const { second } = await setupSessionModels(page)
+  await page.goto('/#/person?session=person-main-1')
+  await expect(page.locator('.person-title')).toHaveText('Person')
+  await expect.poll(() => page.evaluate(() => (window as any).__PW_CHAT_SOCKET__?.allSockets?.some((socket: any) => socket.options?.query?.session_state === '1'))).toBe(true)
+  const row = page.locator('.person-sidebar .session-item').filter({ hasText: 'Second' })
+  async function notice(attentionId: number, readAttentionId: number, working = true) {
+    await page.evaluate(state => {
+      const socket = (window as any).__PW_CHAT_SOCKET__.allSockets.find((socket: any) => socket.options?.query?.session_state === '1')
+      socket.__trigger('sessions.state.updated', state)
+    }, { sessionId: second.id, working, backgroundPending: 0, lastMessageId: 0, readMessageId: 0,
+      lastAttentionId: attentionId, readAttentionId, unread: attentionId > readAttentionId })
+  }
+  await notice(1, 0)
+  await expect(row.locator('.session-item-agent-logo-wrap.streaming')).toBeVisible()
+  await expect(row.locator('.session-item-unread-dot')).toHaveCount(0)
+  await expect(page.locator('.person-task-island')).toHaveCount(0)
+  await page.screenshot({ path: '/tmp/person-collaboration-state.png', animations: 'disabled' })
+  await notice(1, 0, false)
+  await expect(row.locator('.session-item-unread-dot')).toBeVisible()
+  await notice(1, 1, false)
+  await expect(row.locator('.session-item-unread-dot')).toHaveCount(0)
+  await expect(row.locator('.session-item-agent-logo-wrap.streaming')).toHaveCount(0)
+  await notice(2, 1)
+  await expect(row.locator('.session-item-unread-dot')).toHaveCount(0)
+  await switchPersonSession(page, second.id)
+  expect(await emitted(page, 'sessions.read')).not.toContainEqual({ sessionId: second.id, messageId: 0, attentionId: 2 })
+  await notice(2, 1, false)
+  await expect.poll(() => emitted(page, 'sessions.read')).toContainEqual({ sessionId: second.id, messageId: 0, attentionId: 2 })
+  await notice(2, 2, false)
+  await expect(row.locator('.session-item-unread-dot')).toHaveCount(0)
+  await expect(row.locator('.session-item-agent-logo-wrap.streaming')).toHaveCount(0)
+})
+
+test('Person receives relay activity over real sockets after the app presence connection', async ({ page }) => {
+  const { state, second } = await setupSessionModels(page)
+  const http = createServer()
+  const server = new Server(http, { cors: { origin: true } })
+  const states = new Map<string, SessionListState>([state.session.id, second.id].map(sessionId => [sessionId, {
+    sessionId, working: false, backgroundPending: 0, lastMessageId: 0, readMessageId: 0,
+    lastAttentionId: 0, readAttentionId: 0, unread: false,
+  }]))
+  const subscriptions = new Set<import('socket.io').Socket>()
+  const namespaces: string[] = []
+  server.of(/^\/.+$/).on('connection', socket => {
+    namespaces.push(socket.nsp.name)
+    if (socket.nsp.name !== '/chat-run') return
+    if (socket.handshake.query.session_state === '1') {
+      subscriptions.add(socket)
+      socket.on('disconnect', () => subscriptions.delete(socket))
+      socket.emit('sessions.state.snapshot', { sessions: [...states.values()] })
+      socket.on('sessions.read', (receipt, ack) => {
+        const current = states.get(receipt.sessionId)!
+        if (current.working) return ack({ ok: false })
+        current.readMessageId = Math.max(current.readMessageId, Math.min(receipt.messageId, current.lastMessageId))
+        current.readAttentionId = Math.max(current.readAttentionId!, Math.min(receipt.attentionId || 0, current.lastAttentionId!))
+        current.unread = current.lastMessageId > current.readMessageId || current.lastAttentionId! > current.readAttentionId
+        for (const device of subscriptions) device.emit('sessions.state.updated', current)
+        ack({ ok: true })
+      })
+    }
+    socket.on('resume', ({ session_id }) => socket.emit('resumed', {
+      session_id, isWorking: false, messages: [], events: [],
+      messageTotal: 0, messageLoadedCount: 0, hasMoreBefore: false,
+    }))
+  })
+  try {
+    await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve))
+    const origin = `http://127.0.0.1:${(http.address() as any).port}`
+    // Keep HTTP fixtures, but load the real Socket.IO library. Only redirect
+    // its server origin; namespace Manager reuse and handshakes remain real.
+    await page.unroute('**/node_modules/.vite/**/socket__io-client.js*')
+    await page.route('**/node_modules/.vite/**/socket__io-client.js*', route => {
+      const original = new URL(route.request().url())
+      if (original.searchParams.has('real-socket')) return route.continue()
+      original.searchParams.set('real-socket', '1')
+      return route.fulfill({ contentType: 'application/javascript', body: `
+        export * from ${JSON.stringify(original.href)};
+        import { io as actualIo } from ${JSON.stringify(original.href)};
+        export const io = (url, options) => actualIo(${JSON.stringify(origin)} + new URL(url, location.href).pathname, options);
+      ` })
+    })
+    await page.goto('/#/person?session=person-main-1')
+    await expect(page.locator('.person-compose .input-textarea')).toBeVisible()
+    await expect.poll(() => subscriptions.size).toBe(1)
+    expect(namespaces).toContain('/person-presence')
+    expect(namespaces.indexOf('/person-presence')).toBeLessThan(namespaces.indexOf('/chat-run'))
+    const creator = page.locator('.person-sidebar .session-item').filter({ hasText: 'Person' })
+    const recipient = page.locator('.person-sidebar .session-item').filter({ hasText: 'Second' })
+    function publish(sessionId: string, patch: Partial<SessionListState>) {
+      const next = { ...states.get(sessionId)!, ...patch }
+      states.set(sessionId, next)
+      for (const socket of subscriptions) socket.emit('sessions.state.updated', next)
+    }
+    publish(state.session.id, { working: true })
+    await expect(creator.locator('.session-item-agent-logo-wrap.streaming')).toBeVisible()
+    publish(state.session.id, { working: false })
+    publish(second.id, { working: true, lastMessageId: 1, unread: true })
+    await expect(creator.locator('.session-item-agent-logo-wrap.streaming')).toHaveCount(0)
+    await expect(recipient.locator('.session-item-agent-logo-wrap.streaming')).toBeVisible()
+    await expect(recipient.locator('.session-item-unread-dot')).toHaveCount(0)
+    await expect(page.locator('.person-task-island')).toHaveCount(0)
+    await page.screenshot({ path: '/tmp/person-real-socket-relay.png', animations: 'disabled' })
+    publish(second.id, { working: false })
+    await expect(recipient.locator('.session-item-unread-dot')).toBeVisible()
+    await recipient.click()
+    await expect(page.locator('.person-title')).toHaveText('Second')
+    await expect(recipient.locator('.session-item-unread-dot')).toHaveCount(0)
+    expect(states.get(second.id)?.readMessageId).toBe(1)
+    publish(state.session.id, { working: false, lastAttentionId: 2, unread: true })
+    await expect(creator.locator('.session-item-agent-logo-wrap.streaming')).toHaveCount(0)
+    await expect(recipient.locator('.session-item-agent-logo-wrap.streaming')).toHaveCount(0)
+    await expect(creator.locator('.session-item-unread-dot')).toBeVisible()
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())) }
+})
 
 for (const mode of ['light', 'dark'] as const) {
   test(`Person background-task island expands from the center and updates live in ${mode}`, async ({ page }) => {
@@ -342,8 +664,8 @@ for (const mode of ['light', 'dark'] as const) {
     await expect(page.getByRole('button', { name: 'zhezhe · Background tasks · 3', exact: true })).toBeVisible()
     await expect(island.locator('img')).toHaveAttribute('src', '/person/searching.gif')
     const box = await island.boundingBox()
-    expect(Math.abs(box!.x + box!.width / 2 - page.viewportSize()!.width / 2)).toBeLessThan(1)
-    await expect(page.locator('.person-task-activity')).toHaveCSS('position', 'fixed')
+    expect(Math.abs(box!.x + box!.width / 2 - messageBounds!.x - messageBounds!.width / 2)).toBeLessThan(1)
+    await expect(page.locator('.person-task-activity')).toHaveCSS('position', 'absolute')
     expect(await messages.boundingBox()).toEqual(messageBounds)
     expect(await composer.boundingBox()).toEqual(composerBounds)
     const headerBounds = await page.locator('.person-header').boundingBox()
@@ -370,7 +692,8 @@ for (const mode of ['light', 'dark'] as const) {
     await page.setViewportSize({ width: mode === 'dark' ? 1440 : 360, height: 900 })
     await expect.poll(async () => {
       const resized = await island.boundingBox()
-      return Math.abs(resized!.x + resized!.width / 2 - page.viewportSize()!.width / 2)
+      const chat = await messages.boundingBox()
+      return Math.abs(resized!.x + resized!.width / 2 - chat!.x - chat!.width / 2)
     }).toBeLessThan(1)
     await page.locator('.person-compose textarea').click()
     await expect(page.locator('.person-compose textarea')).toBeFocused()
@@ -1778,13 +2101,19 @@ test('Person accumulates small wheel deltas without snapping back between wheel 
   const viewport = picker.locator('.person-bot-viewport')
   const selected = picker.locator('[aria-pressed="true"]')
   await expect(selected).toHaveAttribute('data-bot', 'zhezhe')
-  await selected.hover()
+  // Hover the viewport: hovering the child asks Playwright to scroll that
+  // button into view, which can move the carousel before the wheel gesture.
+  await viewport.hover()
+  await expect.poll(() => viewport.evaluate(el => {
+    const slot = el.querySelector<HTMLElement>('[aria-pressed="true"]')!.parentElement!
+    return Math.abs(slot.offsetLeft + slot.offsetWidth / 2 - el.scrollLeft - el.clientWidth / 2)
+  })).toBeLessThan(1)
   const start = await viewport.evaluate(el => el.scrollLeft)
   for (let i = 0; i < 10; i++) {
     await page.mouse.wheel(0, 16)
     await page.waitForTimeout(32)
   }
-  expect(await viewport.evaluate(el => el.scrollLeft) - start).toBeGreaterThan(120)
+  await expect.poll(async () => await viewport.evaluate(el => el.scrollLeft) - start).toBeCloseTo(160, 0)
   await expect(selected).toHaveAttribute('data-bot', 'xiaohe')
   const stopped = await viewport.evaluate(el => el.scrollLeft)
   await page.waitForTimeout(400)
@@ -1896,6 +2225,14 @@ for (const mode of ['light', 'dark'] as const) {
     await expect(page.locator('.person-title')).toHaveText('Party companion')
     expect(state.conversations.find((session: any) => session.title === 'Party companion').bot_type).toBe('paidui')
     expect(operations.filter(op => op.path.endsWith('/conversations') && op.body).at(-1).body.bot_type).toBe('paidui')
+    // Page-local resume fixtures disappear on reload. Confirm empty history for
+    // the created conversation before expecting its empty-state character.
+    const created = state.conversations.find((session: any) => session.title === 'Party companion')
+    await page.addInitScript(sessionId => {
+      (window as any).__PW_CHAT_SOCKET_RESUMES__[sessionId] = {
+        session_id: sessionId, messages: [], messageTotal: 0, isWorking: false, events: [],
+      }
+    }, created.id)
     await page.reload()
     await expect(page.locator('.empty-logo--person')).toHaveAttribute('alt', 'paidui')
     await expect(page.locator('.empty-logo--person')).toHaveAttribute('src', '/person/paidui/idle.png')
@@ -1981,7 +2318,7 @@ for (const mode of ['light', 'dark'] as const) {
 }
 
 for (const locale of ['en', 'zh'] as const) for (const mobile of [false, true]) {
-  test(`Person fills the hit character name and deploys its transparent image (${locale}, ${mobile ? 'mobile' : 'desktop'})`, async ({ page }) => {
+  test(`Person fills the hit character name and deploys its transparent done animation (${locale}, ${mobile ? 'mobile' : 'desktop'})`, async ({ page }) => {
     const errors: string[] = []
     page.on('pageerror', error => errors.push(String(error)))
     const { state, operations } = await setup(page, mobile ? 'dark' : 'light', mobile, mobile)
@@ -2027,7 +2364,8 @@ for (const locale of ['en', 'zh'] as const) for (const mobile of [false, true]) 
     await page.locator('.new-chat-page').getByRole('button', { name: 'Send', exact: true }).click()
     const overlay = page.locator('.agent-deployment-overlay')
     await expect(overlay).toHaveCount(1)
-    await expect(overlay.locator('img.agent-deployment-card-face')).toHaveAttribute('src', '/person/paidui/idle.gif')
+    await expect(overlay.locator('img.agent-deployment-card-face')).toHaveAttribute('src', '/person/paidui/done.gif')
+    await expect.poll(() => overlay.locator('img.agent-deployment-card-face').evaluate((image: HTMLImageElement) => image.complete && image.naturalWidth > 0)).toBe(true)
     await expect(overlay.locator('img.agent-deployment-card-face')).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
     await expect(overlay.locator('.agent-card')).toHaveCount(0)
     const created = state.conversations.find((session: any) => session.bot_type === 'paidui')
