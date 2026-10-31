@@ -27,6 +27,8 @@ import { codingAgentId } from '../services/chat-run/types'
 import { studioMcpCapabilities } from '../public/runs/mcp-capabilities'
 import { hermesStudioMcpCapabilities } from '../services/chat-run/studio-mcp'
 import { publishAppState, stateEvent, planStateEvent } from '../services/webhooks/app-event-state'
+import { pendingChatEkkoInteractions } from '../public/chat-agent-runtime'
+import { personNotificationSnapshot } from '../services/notifications/person-notification-state'
 import type { BusinessEvent } from '../services/webhooks/business-events'
 import { authenticatedPushActor, prepareRunPushSnapshot } from '../services/notifications/push-registration'
 import { bindRunPushTarget, type PushRunRef, getRunPushTarget } from '../repositories/run-push-store'
@@ -859,7 +861,7 @@ export class ChatRunSocket {
     })
     if (!shared) {
       bindAppEventSubscription(socket, (_user, profile) => {
-        const result: BusinessEvent[] = []
+        const result: BusinessEvent[] = personNotificationSnapshot(_user.id, this.sessionMap)
         for (const [sessionId, state] of this.sessionMap) {
           if (isPrivatePersonSession(sessionId) || !state.isWorking || (state.profile || getSession(sessionId)?.profile || 'default') !== profile) continue
           const source = state.source || getSession(sessionId)?.source
@@ -1674,7 +1676,8 @@ export class ChatRunSocket {
   async respondPersonInteraction(sessionId: string, id: string, response: string, approval: boolean): Promise<boolean> {
     const state = this.sessionMap.get(sessionId)
     const eventName = approval ? 'approval.requested' : 'clarify.requested'
-    if (!state?.events.some(entry => entry.event === eventName && (entry.data?.approval_id === id || entry.data?.clarify_id === id))) return false
+    const pending = isPersonSession(sessionId) ? pendingChatEkkoInteractions(sessionId) : state?.events || []
+    if (!state || !pending.some(entry => entry.event === eventName && (entry.data?.approval_id === id || entry.data?.clarify_id === id))) return false
     let resolved = false
     if (approval) {
       if (!['once', 'session', 'deny'].includes(response)) return false
@@ -2295,7 +2298,9 @@ export class ChatRunSocket {
       this.sessionMap.set(sid, state)
     }
     const resumeEvents = state.isWorking
-      ? state.events
+      ? isPersonSession(sid)
+        ? [...state.events.filter(entry => !['approval.requested', 'approval.resolved', 'clarify.requested', 'clarify.resolved'].includes(entry.event)), ...pendingChatEkkoInteractions(sid)]
+        : state.events
       : (state.events || []).filter(evt => evt?.event === 'run.reattach_failed')
     if (isPersonSession(sid) && !state.isWorking) {
       const question = personChatInteraction(Number(socket.data.user.id), sid)
@@ -3523,10 +3528,11 @@ export class ChatRunSocket {
 
   private emitPendingInteraction(profile: string, event: string, payload: any) {
     if (isPrivatePersonSession(payload?.session_id)) {
-      this.sessionStateSync.observe(event, payload)
       const session = getSession(payload.session_id)
       const userId = Number(session?.studio_user_id)
       if (session?.id !== payload.session_id || !ownsPersonSession(userId, session) || payload.replayed || payload.restored || payload.background_snapshot) return
+      // Silent state must reach the App even when there is no visible notice.
+      this.emitSessionActivity(profile, event, payload)
       const interaction = ['approval.requested', 'approval.resolved', 'clarify.requested', 'clarify.resolved'].includes(event)
       const notice = foregroundNotification(event, payload)
       if (!interaction && (!notice || ['cancelled', 'canceled'].includes(payload.stop_reason))) return
@@ -3579,6 +3585,10 @@ export class ChatRunSocket {
     const state = this.sessionMap.get(sessionId)
     const source = state?.source || getSession(sessionId)?.source
     const runId = state?.activeRunMarker || state?.responseRun?.runMarker || payload.run_marker || state?.runId || payload.run_id
+    if (isPersonSession(sessionId)) publishAppState({ ...stateEvent('person.run.updated', profile,
+      { session_id: sessionId, run_id: runId },
+      { state: { session_id: sessionId, status, timestamp: Date.now(), started_at: state?.runStartedAt,
+        reset_progress: event === 'run.started' } }), source: 'person' })
     if (!isPrivatePersonSession(sessionId) && source !== 'group_chat' && source !== 'workflow') publishAppState(stateEvent('chat.run.updated', profile,
       { session_id: sessionId, run_id: runId },
       { state: { session_id: sessionId, status, timestamp: Date.now(), started_at: state?.runStartedAt,
